@@ -13,21 +13,19 @@
 //!
 //! ## Scope of this slice
 //!
-//! Only the three v0.1 entry points whose backing logic already
-//! exists:
+//! All v0.1 query / verify / introspection entry points whose
+//! backing logic exists today:
 //!
 //! - [`flatbuffers_query`] — single leaf, `text`.
 //! - [`flatbuffers_query_array`] — fanout / multi-leaf, `text[]`.
+//! - [`flatbuffers_query_multi`] — fanout / multi-leaf, `SETOF text`,
+//!   suitable for `LATERAL` joins and `WITH ORDINALITY`.
 //! - [`flatbuffers_verify`] — boolean, suitable for `CHECK`.
 //! - [`flatbuffers_root_type`] — diagnostic helper returning the
 //!   registered root-table name.
 //!
 //! ### Deliberately deferred (each gets its own micro-slice)
 //!
-//! - `flatbuffers_query_multi` — needs SETOF wiring (one row per
-//!   leaf). The Vec-shaped executor result already supports it; the
-//!   pgrx [`SetOfIterator`] / [`TableIterator`] glue lives in its
-//!   own slice.
 //! - `flatbuffers_to_json{,_text}` and
 //!   `flatbuffers_from_json{,_text}` — live in a future
 //!   `json.rs` slice.
@@ -46,6 +44,7 @@
 use crate::query::{execute, parse};
 use crate::schema_cache::lookup_schema;
 use crate::verify::{verify, Bounds};
+use pgrx::iter::SetOfIterator;
 use pgrx::prelude::*;
 
 /// Schema name used when a query string omits the `schema:` prefix.
@@ -135,6 +134,50 @@ fn flatbuffers_query_array(query: &str, buf: &[u8]) -> Vec<String> {
         Ok(v) => v.into_iter().flatten().collect(),
         Err(e) => error!("flatbuffers_query_array: {e}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// flatbuffers_query_multi
+// ---------------------------------------------------------------------------
+
+/// Run `query` against `buf` and return all present leaves as a
+/// `SETOF text`, one row per leaf in wire-format order. Equivalent
+/// to [`flatbuffers_query_array`] up to the row-vs-array shape
+/// (skipping absent leaves the same way) but suitable for `LATERAL`
+/// joins, `unnest`-free aggregation, and `WITH ORDINALITY` (where
+/// the ordinal numbers each *present* leaf 1..N in wire order).
+///
+/// Empty `bytea` and the no-match cases (`[*]` over an absent /
+/// empty vector) yield zero rows. Same `STRICT` / `STABLE` /
+/// `parallel_safe` rationale as [`flatbuffers_query`]; same
+/// `ERROR`-on-verifier-failure contract.
+///
+/// The returned [`SetOfIterator`] owns its data (`'static`), so the
+/// underlying `buf` is free to be dropped between rows \u2014 today we
+/// materialise the whole [`Vec<Option<String>>`] up-front and stream
+/// from it. Streaming directly off the [`Table`] would save a copy
+/// for huge fanouts; that's a future micro-slice once profiling
+/// shows it matters (the design's "verifier result caching" note in
+/// \u00a710 carves out the same scope).
+#[pg_extern(stable, parallel_safe, strict)]
+fn flatbuffers_query_multi(query: &str, buf: &[u8]) -> SetOfIterator<'static, String> {
+    if buf.is_empty() {
+        return SetOfIterator::empty();
+    }
+
+    let parsed = parse(query)
+        .unwrap_or_else(|e| error!("flatbuffers_query_multi: invalid query {query:?}: {e}"));
+
+    let schema_name = parsed.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
+    let cached = lookup_schema(schema_name);
+    let schema_view = cached.schema();
+
+    let leaves = match execute(buf, &schema_view, &parsed, &Bounds::default()) {
+        Ok(v) => v,
+        Err(e) => error!("flatbuffers_query_multi: {e}"),
+    };
+
+    SetOfIterator::new(leaves.into_iter().flatten())
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +645,91 @@ mod tests {
         )
         .expect("SPI failure");
         assert_eq!(v.as_deref(), Some("alpha"));
+    }
+
+    // -- flatbuffers_query_multi --
+
+    /// `STRICT` short-circuits NULL inputs \u2014 zero rows, never the
+    /// function body.
+    #[pg_test]
+    fn pg_query_multi_null_buf_returns_zero_rows() {
+        let n = Spi::get_one::<i64>(
+            "SELECT count(*) FROM flatbuffers_query_multi('B:tags[*]', NULL::bytea)",
+        )
+        .expect("SPI failure")
+        .expect("count is non-null");
+        assert_eq!(n, 0);
+    }
+
+    /// Empty `bytea` short-circuits to zero rows (mirrors the empty
+    /// array `flatbuffers_query_array` returns; just a different
+    /// shape).
+    #[pg_test]
+    fn pg_query_multi_empty_buf_returns_zero_rows() {
+        let n = Spi::get_one::<i64>(
+            "SELECT count(*) FROM flatbuffers_query_multi('B:tags[*]', ''::bytea)",
+        )
+        .expect("SPI failure")
+        .expect("count is non-null");
+        assert_eq!(n, 0);
+    }
+
+    /// Happy-path fanout: three tags \u2192 three rows in wire-format
+    /// order. `array_agg` round-trips so we can pin the order
+    /// assertion in one [`Spi::get_one`] call without needing a
+    /// cursor.
+    #[pg_test]
+    fn pg_query_multi_happy_path_strings() {
+        register("default", "B", build_b_schema_bfbs());
+        let buf = build_b_buf(Some(&["red", "green", "blue"]));
+        let v = Spi::get_one_with_args::<Vec<Option<String>>>(
+            "SELECT array_agg(t ORDER BY ord) \
+             FROM flatbuffers_query_multi('B:tags[*]', $1) \
+                 WITH ORDINALITY AS s(t, ord)",
+            &[buf.into()],
+        )
+        .expect("SPI failure")
+        .expect("NULL from happy path");
+        assert_eq!(
+            v,
+            vec![
+                Some("red".to_owned()),
+                Some("green".to_owned()),
+                Some("blue".to_owned()),
+            ],
+        );
+    }
+
+    /// Absent vector under `[*]` \u2192 zero rows.
+    #[pg_test]
+    fn pg_query_multi_absent_vector_is_zero_rows() {
+        register("default", "B", build_b_schema_bfbs());
+        let buf = build_b_buf(None);
+        let n = Spi::get_one_with_args::<i64>(
+            "SELECT count(*) FROM flatbuffers_query_multi('B:tags[*]', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure")
+        .expect("count is non-null");
+        assert_eq!(n, 0);
+    }
+
+    /// `LATERAL` against a single-row source: the SETOF wrapper is
+    /// the whole reason this function exists, so pin a tiny
+    /// representative shape.
+    #[pg_test]
+    fn pg_query_multi_lateral_join() {
+        register("default", "B", build_b_schema_bfbs());
+        let buf = build_b_buf(Some(&["a", "b"]));
+        let v = Spi::get_one_with_args::<Vec<Option<String>>>(
+            "SELECT array_agg(tag) \
+             FROM (SELECT $1::bytea AS payload) src, \
+                  LATERAL flatbuffers_query_multi('B:tags[*]', src.payload) AS tag",
+            &[buf.into()],
+        )
+        .expect("SPI failure")
+        .expect("NULL from happy path");
+        assert_eq!(v, vec![Some("a".to_owned()), Some("b".to_owned())]);
     }
 
     // -- flatbuffers_verify --
