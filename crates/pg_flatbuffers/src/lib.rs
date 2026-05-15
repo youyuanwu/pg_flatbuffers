@@ -11,6 +11,7 @@ use pgrx::prelude::*;
 ::pgrx::pg_module_magic!(name, version);
 
 mod catalog;
+mod functions;
 mod query;
 mod schema_cache;
 mod verify;
