@@ -13,6 +13,7 @@ use pgrx::prelude::*;
 mod catalog;
 mod query;
 mod schema_cache;
+mod verify;
 
 // Catalog DDL. Must be emitted *after* the Rust functions it
 // references in CHECK / trigger bodies are created.
