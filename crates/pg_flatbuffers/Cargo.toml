@@ -20,7 +20,10 @@ pg18     = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test  = []
 
 [dependencies]
-pgrx = { workspace = true }
+pgrx                   = { workspace = true }
+flatbuffers            = { workspace = true }
+flatbuffers-reflection = { workspace = true }
+thiserror              = { workspace = true }
 
 [dev-dependencies]
 pgrx-tests = { workspace = true }

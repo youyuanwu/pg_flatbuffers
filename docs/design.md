@@ -102,14 +102,14 @@ query that resolves through the affected schema name. The extension
 therefore treats the catalog as privileged infrastructure by default:
 
 - The extension install script creates a dedicated role
-  `pg_flatbuffers_admin` (NOLOGIN, NOINHERIT) and makes it the owner of
+  `flatbuffers_admin` (NOLOGIN, NOINHERIT) and makes it the owner of
   `flatbuffers_schemas`.
 - `INSERT`, `UPDATE`, `DELETE`, and `TRUNCATE` on the table are
   `REVOKE`d from `PUBLIC`. `SELECT` is granted to `PUBLIC` (read access
   is required by the query functions).
-- `pg_flatbuffers_admin` is the only role with write access by default.
+- `flatbuffers_admin` is the only role with write access by default.
   Operators grant the role to specific application or migration roles
-  with `GRANT pg_flatbuffers_admin TO my_app_owner`.
+  with `GRANT flatbuffers_admin TO my_app_owner`.
 - Schema validation (`flatbuffers_validate_schema(bfbs)`) runs as a
   `CHECK` constraint or `BEFORE INSERT OR UPDATE` trigger on the table
   so that no row reaches the cache without passing the same verifier
@@ -118,16 +118,16 @@ therefore treats the catalog as privileged infrastructure by default:
 Install-script SQL (illustrative):
 
 ```sql
-CREATE ROLE pg_flatbuffers_admin NOLOGIN NOINHERIT;
-ALTER TABLE flatbuffers_schemas OWNER TO pg_flatbuffers_admin;
+CREATE ROLE flatbuffers_admin NOLOGIN NOINHERIT;
+ALTER TABLE flatbuffers_schemas OWNER TO flatbuffers_admin;
 REVOKE ALL                ON flatbuffers_schemas FROM PUBLIC;
 GRANT  SELECT             ON flatbuffers_schemas TO   PUBLIC;
 GRANT  INSERT, UPDATE,
-       DELETE, TRUNCATE   ON flatbuffers_schemas TO   pg_flatbuffers_admin;
+       DELETE, TRUNCATE   ON flatbuffers_schemas TO   flatbuffers_admin;
 ```
 
 Readme guidance: never `GRANT INSERT ON flatbuffers_schemas TO PUBLIC`
-and never run application code as `pg_flatbuffers_admin` unless schema
+and never run application code as `flatbuffers_admin` unless schema
 registration is explicitly part of that code path. Schema rotation
 should happen out-of-band (migration tooling) under the admin role.
 

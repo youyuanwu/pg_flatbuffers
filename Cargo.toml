@@ -21,10 +21,11 @@ authors      = ["pg_flatbuffers contributors"]
 pgrx       = { version = "=0.18.0" }
 pgrx-tests = { version = "=0.18.0" }
 
-# These will become real dependencies once the executor lands; declared
-# here so the version is owned by the workspace from day one.
+# FlatBuffers runtime + reflection bindings (separate crates, separate
+# version lines: `flatbuffers` tracks the FB project version, but the
+# `flatbuffers-reflection` Rust crate is independently versioned).
 flatbuffers            = "25"
-flatbuffers-reflection = "25"
+flatbuffers-reflection = "0.1"
 serde_json             = "1"
 thiserror              = "2"
 

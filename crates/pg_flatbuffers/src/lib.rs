@@ -1,13 +1,24 @@
 //! pg_flatbuffers — Postgres extension for querying and converting
 //! FlatBuffers payloads stored in `bytea` columns.
 //!
-//! v0.1 surface (this slice): just `flatbuffers_extension_version()`.
-//! Subsequent slices add the schema catalog, query parser/executor,
-//! and JSON conversion per `docs/design.md`.
+//! v0.1 surface (this slice): version function + `flatbuffers_schemas`
+//! catalog with `flatbuffers_validate_schema`. Subsequent slices add
+//! the schema cache, query parser/executor, and JSON conversion per
+//! `docs/design.md`.
 
 use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!(name, version);
+
+mod catalog;
+
+// Catalog DDL. Must be emitted *after* `flatbuffers_validate_schema`
+// is created, because the CHECK constraint references it.
+extension_sql_file!(
+    "../sql/catalog.sql",
+    name = "catalog",
+    requires = [catalog::flatbuffers_validate_schema],
+);
 
 /// Returns the extension version as a packed integer:
 /// `MAJOR * 10_000 + MINOR * 100 + PATCH`.
