@@ -588,6 +588,185 @@ mod tests {
         fbb.finished_data().to_vec()
     }
 
+    /// Build a minimal struct-descent schema for the SQL smoke:
+    ///
+    /// ```text
+    /// struct Vec3 { x:float; y:float; z:float; }   // bytesize 12, align 4
+    /// table  Point { name:string; pos:Vec3; }      // pos at vtable slot 6
+    /// ```
+    ///
+    /// Object indices after alphabetical sort: `Point` = 0, `Vec3` = 1.
+    /// Full unit coverage of struct descent (nested structs, scalar
+    /// leaves by id, absent / index / keys rejection) lives in the
+    /// executor module; this fixture exists purely to exercise the
+    /// SQL surface end-to-end.
+    fn build_point_schema_bfbs() -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        use flatbuffers_reflection::reflection::{
+            BaseType, Enum, Field as RField, FieldArgs, Object as RObject, ObjectArgs,
+            Schema as RSchema, SchemaArgs, Type, TypeArgs,
+        };
+        let mut fbb = FlatBufferBuilder::new();
+
+        let float_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Float,
+                ..Default::default()
+            },
+        );
+        let str_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::String,
+                ..Default::default()
+            },
+        );
+
+        // -- struct Vec3 --
+        let vec3_x_n = fbb.create_string("x");
+        let vec3_x = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(vec3_x_n),
+                type_: Some(float_t),
+                id: 0,
+                offset: 0,
+                ..Default::default()
+            },
+        );
+        let vec3_y_n = fbb.create_string("y");
+        let vec3_y = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(vec3_y_n),
+                type_: Some(float_t),
+                id: 1,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let vec3_z_n = fbb.create_string("z");
+        let vec3_z = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(vec3_z_n),
+                type_: Some(float_t),
+                id: 2,
+                offset: 8,
+                ..Default::default()
+            },
+        );
+        let vec3_fields = fbb.create_vector(&[vec3_x, vec3_y, vec3_z]);
+        let vec3_n = fbb.create_string("Vec3");
+        let vec3 = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(vec3_n),
+                fields: Some(vec3_fields),
+                is_struct: true,
+                bytesize: 12,
+                minalign: 4,
+                ..Default::default()
+            },
+        );
+
+        // -- table Point { name:string @ slot 4; pos:Vec3 @ slot 6 } --
+        // Vec3 sorts as object index 1.
+        let vec3_obj_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Obj,
+                index: 1,
+                ..Default::default()
+            },
+        );
+        let point_name_n = fbb.create_string("name");
+        let point_name = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(point_name_n),
+                type_: Some(str_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let point_pos_n = fbb.create_string("pos");
+        let point_pos = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(point_pos_n),
+                type_: Some(vec3_obj_t),
+                id: 1,
+                offset: 6,
+                ..Default::default()
+            },
+        );
+        let point_fields = fbb.create_vector(&[point_name, point_pos]);
+        let point_n = fbb.create_string("Point");
+        let point = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(point_n),
+                fields: Some(point_fields),
+                ..Default::default()
+            },
+        );
+
+        // Sorted alphabetically: Point (0), Vec3 (1).
+        let objects = fbb.create_vector(&[point, vec3]);
+        let enums = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum>>(&[]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(point),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// `Vec3` mirror used to push the inline struct into a `Point`
+    /// table. `repr(C, packed)` matches the FlatBuffers wire layout
+    /// for structs (no compiler padding).
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    struct TestVec3 {
+        x: f32,
+        y: f32,
+        z: f32,
+    }
+
+    // SAFETY: `repr(C, packed)` makes the in-memory bytes match the
+    // on-wire little-endian layout on every supported host.
+    impl flatbuffers::Push for TestVec3 {
+        type Output = TestVec3;
+        unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+            let src = std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            );
+            dst[..src.len()].copy_from_slice(src);
+        }
+    }
+
+    /// Build a `Point` buffer with the supplied name and pos.
+    fn build_point_buf(name: &str, pos: TestVec3) -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        let mut fbb = FlatBufferBuilder::new();
+        let name_off = fbb.create_string(name);
+        let t = fbb.start_table();
+        fbb.push_slot_always(4, name_off); // slot 4 = name
+        fbb.push_slot_always(6, pos); // slot 6 = pos (inline struct)
+        let p = fbb.end_table(t);
+        fbb.finish_minimal(p);
+        fbb.finished_data().to_vec()
+    }
+
     /// Register `bfbs` as schema `name` rooted at `root_table` via
     /// SPI. Tests run as superuser (pgrx-tests default), so the role
     /// check on `flatbuffers_schemas` is bypassed.
@@ -839,6 +1018,31 @@ mod tests {
                 Some("gamma".to_owned()),
             ],
         );
+    }
+
+    // -- struct descent (design §7.2 / §4.3) --
+
+    /// SQL-side smoke for `walk_struct`: descend into an inline
+    /// struct field and stringify a scalar leaf. Full unit coverage
+    /// of nested-struct descent, absence handling, and step-shape
+    /// rejection lives in the executor module.
+    #[pg_test]
+    fn pg_query_struct_field_scalar_leaf() {
+        register("default", "Point", build_point_schema_bfbs());
+        let buf = build_point_buf(
+            "p",
+            TestVec3 {
+                x: 1.5,
+                y: 2.5,
+                z: 3.5,
+            },
+        );
+        let v = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Point:pos.y', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure");
+        assert_eq!(v.as_deref(), Some("2.5"));
     }
 
     // -- flatbuffers_query_multi --
