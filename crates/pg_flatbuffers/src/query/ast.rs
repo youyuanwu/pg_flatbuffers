@@ -76,6 +76,10 @@ pub enum MapKey {
     /// integral. Currently never produced by the parser; kept here so
     /// the executor can construct the variant without a separate
     /// internal type.
+    #[allow(
+        dead_code,
+        reason = "executor pattern-matches on this variant; constructor lands with the future numeric-literal-key parser slice"
+    )]
     Int(i64),
 }
 

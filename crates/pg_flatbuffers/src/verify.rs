@@ -151,6 +151,13 @@ impl VerifyError {
     /// `Display` output. Conservative: callers can treat `false` as
     /// "not provably a bound failure" without misclassifying anything
     /// as a structural error.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "only consumed from the in-module test suite; production call site lands with the deferred `pg_flatbuffers.strict` GUC plumbing (§10)"
+        )
+    )]
     pub fn is_bound_exceedance(&self) -> bool {
         match self {
             VerifyError::Invalid(msg) => {

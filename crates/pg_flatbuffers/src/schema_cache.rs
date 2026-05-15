@@ -120,6 +120,13 @@ pub fn lookup_schema(name: &str) -> Arc<CachedSchema> {
 /// Drop one entry by name. No-op if absent. Currently only used by
 /// tests; the relcache callback uses [`invalidate_all`] instead because
 /// it does not know the schema *name* from the catalog `Oid`.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "only consumed from the in-module test suite; kept on the public API for future direct-invalidation call sites"
+    )
+)]
 pub fn invalidate(name: &str) {
     cache().lock().pop(name);
 }
@@ -145,34 +152,37 @@ fn load_and_insert(name: &str) -> Arc<CachedSchema> {
     // resolved OID and can target its invalidation precisely.
     let _ = catalog_oid();
 
+    // The three columns we lift out of `flatbuffers_schemas` per row:
+    // `(bfbs, root_table, file_identifier)`. Aliased to keep the
+    // closure return type readable (and silence `clippy::type_complexity`).
+    type SchemaRow = (Vec<u8>, String, Option<String>);
+
     // SPI: parameterized lookup. `name` is bound as text — SQL
     // injection-safe. Use `connect_mut` directly so we can distinguish
     // "no rows" (schema not registered) from a real SPI error;
     // `Spi::get_three_with_args` collapses the two and we want a clean
     // user-facing message for the common case.
-    let row = Spi::connect_mut(
-        |client| -> spi::Result<Option<(Vec<u8>, String, Option<String>)>> {
-            let table = client.update(
-                "SELECT bfbs, root_table, file_identifier \
+    let row = Spi::connect_mut(|client| -> spi::Result<Option<SchemaRow>> {
+        let table = client.update(
+            "SELECT bfbs, root_table, file_identifier \
              FROM flatbuffers_schemas WHERE name = $1",
-                Some(1),
-                &[name.to_string().into()],
-            )?;
-            if table.is_empty() {
-                return Ok(None);
-            }
-            let row = table.first();
-            let bfbs = row
-                .get::<&[u8]>(1)?
-                .expect("flatbuffers_schemas.bfbs is NOT NULL")
-                .to_vec();
-            let root_table = row
-                .get::<String>(2)?
-                .expect("flatbuffers_schemas.root_table is NOT NULL");
-            let file_identifier = row.get::<String>(3)?;
-            Ok(Some((bfbs, root_table, file_identifier)))
-        },
-    )
+            Some(1),
+            &[name.to_string().into()],
+        )?;
+        if table.is_empty() {
+            return Ok(None);
+        }
+        let row = table.first();
+        let bfbs = row
+            .get::<&[u8]>(1)?
+            .expect("flatbuffers_schemas.bfbs is NOT NULL")
+            .to_vec();
+        let root_table = row
+            .get::<String>(2)?
+            .expect("flatbuffers_schemas.root_table is NOT NULL");
+        let file_identifier = row.get::<String>(3)?;
+        Ok(Some((bfbs, root_table, file_identifier)))
+    })
     .unwrap_or_else(|e| error!("SPI failure looking up flatbuffers schema {name:?}: {e}"));
 
     let (bfbs, root_table, file_identifier) =
