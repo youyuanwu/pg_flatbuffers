@@ -6,23 +6,32 @@
 //!
 //! This module is the smallest viable executor: a starting point that
 //! the next slices grow into the full design. It supports paths that
-//! walk through nested tables to a scalar/string leaf:
+//! walk through nested tables and vectors to a scalar/string leaf:
 //!
 //! - `Step::Field` (by name and by `#id`).
 //! - Descent into sub-tables (`BaseType::Obj` where the referenced
 //!   `Object` is **not** a struct).
+//! - `Step::Index` for vector access (§7.2 step 2). Out-of-range
+//!   indices short-circuit to `Ok(None)` per design §4.3. Supported
+//!   element types: scalars, bool, string, and tables (descend with
+//!   the remaining steps).
 //! - Stringification of scalar (int/uint/float/bool) and string leaves
 //!   via [`flatbuffers_reflection::get_any_field_string`].
 //!
 //! Deliberately deferred to dedicated micro-slices, each returning a
 //! clear [`ExecuteError::Unsupported*`] variant today:
 //!
-//! - `Step::Index`, `Step::All` — vector access (§7.2 step 2/3).
+//! - `Step::All` — vector fanout (§7.2 step 3). Routed through
+//!   `walk_vector` and rejected there with `UnsupportedStep`.
 //! - `Step::MapKey`, `Step::MapKeys` — `(key)`-vector lookups
 //!   (§7.2 step 4/5).
-//! - Struct descent — needs a separate `walk_struct` cursor since
-//!   structs are inline fixed-size and use different accessors than
-//!   tables.
+//! - Struct descent (bare and as vector elements) — needs a separate
+//!   `walk_struct` cursor since structs are inline fixed-size and
+//!   use different accessors than tables.
+//! - `BaseType::Vector64` — element-offset arithmetic uses 64-bit
+//!   offsets and `flatbuffers::Vector<T>` only handles 32-bit;
+//!   rejected loudly so we don't silently truncate addresses.
+//! - Vectors of unions / vectors of vectors / vectors of arrays.
 //! - Union dispatch — needs the discriminator-slot pairing logic from
 //!   §4.3 ("Union types").
 //! - The `pg_flatbuffers.proto3_defaults` GUC (§10) — today scalar
@@ -34,10 +43,10 @@
 use super::ast::{FieldRef, Query, Step};
 use crate::verify::VerifyError;
 use crate::verify::{verify, Bounds};
-use flatbuffers::Table;
+use flatbuffers::{ForwardsUOffset, Table, Vector};
 use flatbuffers_reflection::reflection::{BaseType, Field, Object, Schema};
 use flatbuffers_reflection::{
-    get_any_field_string, get_any_root, get_field_table, FlatbufferError,
+    get_any_field_string, get_any_root, get_field_table, get_field_vector, FlatbufferError,
 };
 use thiserror::Error;
 
@@ -176,6 +185,14 @@ fn walk_table(
         return Ok(None);
     }
 
+    // Vector dispatch must come before the leaf/descent fork, because
+    // a vector field is *never* a leaf and *never* descends through
+    // `walk_table`: it consumes one extra path step (the indexer)
+    // before we know what to do next.
+    if matches!(base_type, BaseType::Vector | BaseType::Vector64) {
+        return walk_vector(table, &field, schema, tail);
+    }
+
     if tail.is_empty() {
         if !is_present {
             // Absent scalar at leaf — synthesize the schema default.
@@ -225,6 +242,215 @@ fn walk_table(
         }
         other => Err(ExecuteError::UnsupportedType {
             field: field_name.to_string(),
+            type_name: base_type_name(other),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vector dispatch
+// ---------------------------------------------------------------------------
+
+/// Walk a vector field. `field` is the [`Field`] whose
+/// [`BaseType`] is `Vector` (or `Vector64` — currently rejected,
+/// since the upstream verifier doesn't yet validate Vector64
+/// payloads). `steps` is the *remaining* path after the vector field
+/// itself; it must lead with one of `Step::Index`, `Step::All`,
+/// `Step::MapKey`, or `Step::MapKeys`. The latter three are deferred
+/// to dedicated micro-slices and rejected here with
+/// [`ExecuteError::UnsupportedStep`].
+///
+/// Out-of-range indices return `Ok(None)` (design §4.3 "Path
+/// traversal short-circuits at out-of-range index"), distinct from
+/// "the vector itself was absent" which also returns `Ok(None)`.
+fn walk_vector(
+    table: &Table,
+    field: &Field,
+    schema: &Schema,
+    steps: &[Step],
+) -> Result<Option<String>, ExecuteError> {
+    let field_name = field.name();
+
+    // Vector64 is in scope for the design but not for v0.1: the
+    // upstream verifier still treats it the same as Vector for length
+    // bookkeeping, but element-offset arithmetic uses 64-bit offsets
+    // and our `flatbuffers::Vector<T>` accessors only handle 32-bit.
+    // Reject loudly so we don't silently truncate addresses.
+    if field.type_().base_type() == BaseType::Vector64 {
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: "vector64",
+        });
+    }
+
+    // A bare `Order:items` (no indexer) cannot be stringified in
+    // v0.1: the design doesn't define a textual form for whole
+    // vectors, and the JSON path lives in a future slice.
+    let (head, tail) = match steps.split_first() {
+        Some(pair) => pair,
+        None => {
+            return Err(ExecuteError::UnsupportedType {
+                field: field_name.to_string(),
+                type_name: "vector (use [i] / [*] / [key] / |keys to access elements)",
+            });
+        }
+    };
+
+    let idx = match head {
+        Step::Index(i) => *i,
+        Step::All => return Err(ExecuteError::UnsupportedStep { what: "[*]" }),
+        Step::MapKey(_) => return Err(ExecuteError::UnsupportedStep { what: "[map-key]" }),
+        Step::MapKeys => return Err(ExecuteError::UnsupportedStep { what: "|keys" }),
+        // A `Step::Field` after a vector field is a parser bug — the
+        // grammar requires an indexer right after the vector. Be
+        // defensive in case the AST grows new arms.
+        Step::Field(_) => {
+            return Err(ExecuteError::Internal(format!(
+                "expected `[i]` / `[*]` / `[key]` / `|keys` after vector field {field_name:?}, \
+                 found a `Field` step"
+            )));
+        }
+    };
+
+    let element_base_type = field.type_().element();
+
+    // Vectors of tables are the only element type that *consumes*
+    // additional steps (descent into the indexed sub-table).
+    if element_base_type == BaseType::Obj {
+        let child_index = field.type_().index();
+        if child_index < 0 {
+            return Err(ExecuteError::Internal(format!(
+                "vector field {field_name:?} has element BaseType::Obj but negative \
+                 object index ({child_index})"
+            )));
+        }
+        let child_object = schema.objects().get(
+            usize::try_from(child_index).expect("non-negative after the explicit < 0 guard above"),
+        );
+        if child_object.is_struct() {
+            // Vectors of inline structs need the same dedicated
+            // walk_struct cursor as bare struct descent (deferred).
+            return Err(ExecuteError::UnsupportedType {
+                field: field_name.to_string(),
+                type_name: "vector of struct",
+            });
+        }
+
+        // SAFETY: see `execute`; the buffer was verified, and `field`
+        // came from the schema. The verifier asserts the vector slot
+        // resolves to a well-formed Vector<ForwardsUOffset<Table>>
+        // when `field.type_().element() == Obj`.
+        let vec_opt = unsafe {
+            table.get::<ForwardsUOffset<Vector<ForwardsUOffset<Table>>>>(field.offset(), None)
+        };
+        let vec = match vec_opt {
+            Some(v) => v,
+            // Defensive: vtable said present but follow returned
+            // None. Match the absent-vector contract.
+            None => return Ok(None),
+        };
+        if idx >= vec.len() {
+            return Ok(None);
+        }
+        let elem_table = vec.get(idx);
+
+        if tail.is_empty() {
+            // `items[3]` on a vector of tables produces a sub-table
+            // *value*, which has no v0.1 textual form. Same rationale
+            // as bare-table-at-leaf in `read_leaf`.
+            return Err(ExecuteError::UnsupportedType {
+                field: field_name.to_string(),
+                type_name: "vector-of-table element (sub-table at leaf)",
+            });
+        }
+        return walk_table(&elem_table, &child_object, schema, tail);
+    }
+
+    // Scalar / string element types: this *must* be the terminal
+    // step. `items[3].sub` against a Vector<int> is a path error.
+    if !tail.is_empty() {
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: base_type_name(element_base_type),
+        });
+    }
+    read_vector_element(table, field, idx, element_base_type)
+}
+
+/// Stringify the `idx`-th element of a vector whose elements are
+/// scalars or strings. Returns `Ok(None)` when the index is past the
+/// end or the vector itself is absent.
+///
+/// The match arm per scalar type is verbose but unavoidable:
+/// [`get_field_vector`] is generic over `T: Follow`, so we must pick
+/// a concrete `T` per [`BaseType`] to read individual elements.
+fn read_vector_element(
+    table: &Table,
+    field: &Field,
+    idx: usize,
+    element_base_type: BaseType,
+) -> Result<Option<String>, ExecuteError> {
+    // Helper: read a typed scalar vector and stringify the indexed
+    // element via `Display`. Mirrors the `i64::Display` / `f64::Display`
+    // formatting used by `read_leaf` / `scalar_default_string` so an
+    // element value matches what the same value would render as if
+    // stored directly in a scalar field.
+    macro_rules! scalar {
+        ($t:ty) => {{
+            // SAFETY: see `execute`; the buffer was verified, and
+            // `field.type_().element()` matches `$t`. The
+            // `get_field_vector` helper additionally checks that
+            // `field.type_().base_type() == BaseType::Vector`.
+            let vec_opt =
+                unsafe { get_field_vector::<$t>(table, field) }.map_err(map_reflection_err)?;
+            let vec = match vec_opt {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            if idx >= vec.len() {
+                return Ok(None);
+            }
+            Ok(Some(vec.get(idx).to_string()))
+        }};
+    }
+
+    match element_base_type {
+        // Bool is wire-encoded as `u8`; stringify as `0`/`1` to
+        // match the way present bool *fields* render through the
+        // upstream `get_any_field_string` (see `read_leaf`).
+        BaseType::Bool | BaseType::UByte => scalar!(u8),
+        BaseType::Byte => scalar!(i8),
+        BaseType::Short => scalar!(i16),
+        BaseType::UShort => scalar!(u16),
+        BaseType::Int => scalar!(i32),
+        BaseType::UInt => scalar!(u32),
+        BaseType::Long => scalar!(i64),
+        BaseType::ULong => scalar!(u64),
+        BaseType::Float => scalar!(f32),
+        BaseType::Double => scalar!(f64),
+        BaseType::String => {
+            // SAFETY: see `execute`. The schema asserts the element
+            // type is `String`, so the vector slot is a
+            // `ForwardsUOffset<Vector<ForwardsUOffset<&str>>>`. We
+            // can't use the `get_field_vector` helper here because
+            // its `T: Follow<Inner = T>` bound rejects
+            // `ForwardsUOffset<&str>` (whose `Inner` is `&str`).
+            let vec_opt = unsafe {
+                table.get::<ForwardsUOffset<Vector<ForwardsUOffset<&str>>>>(field.offset(), None)
+            };
+            let vec = match vec_opt {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            if idx >= vec.len() {
+                return Ok(None);
+            }
+            Ok(Some(vec.get(idx).to_string()))
+        }
+        // Vectors of unions / vectors-of-vectors / vector-of-array
+        // need their own slices.
+        other => Err(ExecuteError::UnsupportedType {
+            field: field.name().to_string(),
             type_name: base_type_name(other),
         }),
     }
@@ -733,5 +959,378 @@ mod tests {
         // Garbage buffer (4 bytes, root offset out of range).
         let err = run("Order:id", &[0u8, 1, 2, 3], &bfbs).unwrap_err();
         assert!(matches!(err, ExecuteError::Verify(_)), "got {err:?}");
+    }
+
+    // ---------------------------------------------------------------
+    // Vector fixtures + tests
+    // ---------------------------------------------------------------
+
+    /// Build a vector-bearing schema, kept separate from
+    /// `build_schema()` so the two fixtures evolve independently:
+    ///
+    /// ```text
+    /// table Item {
+    ///   sku: string;          // id 0, vtable offset 4
+    /// }
+    /// table Bag {
+    ///   flags: [bool];        // id 0, vtable offset 4
+    ///   items: [Item];        // id 1, vtable offset 6
+    ///   nums:  [int];         // id 2, vtable offset 8
+    ///   tags:  [string];      // id 3, vtable offset 10
+    /// }
+    /// root_type Bag;
+    /// ```
+    ///
+    /// Field vectors are sorted alphabetically (flags, items, nums,
+    /// tags). Object vector is sorted (Bag < Item).
+    fn build_vec_schema() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+
+        let str_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::String,
+                ..Default::default()
+            },
+        );
+
+        // -- Item.sku: string (single-field table) --
+        let sku_n = fbb.create_string("sku");
+        let sku_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(sku_n),
+                type_: Some(str_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let item_fields = fbb.create_vector(&[sku_f]);
+        let item_n = fbb.create_string("Item");
+        let item = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(item_n),
+                fields: Some(item_fields),
+                ..Default::default()
+            },
+        );
+
+        // -- Vector element types --
+        // Object index 1 = Item (Bag is 0, Item is 1 once sorted).
+        let vec_bool_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::Bool,
+                ..Default::default()
+            },
+        );
+        let vec_item_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::Obj,
+                index: 1,
+                ..Default::default()
+            },
+        );
+        let vec_int_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::Int,
+                ..Default::default()
+            },
+        );
+        let vec_str_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::String,
+                ..Default::default()
+            },
+        );
+
+        // -- Bag fields (sorted: flags, items, nums, tags) --
+        let flags_n = fbb.create_string("flags");
+        let flags_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(flags_n),
+                type_: Some(vec_bool_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let items_n = fbb.create_string("items");
+        let items_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(items_n),
+                type_: Some(vec_item_t),
+                id: 1,
+                offset: 6,
+                ..Default::default()
+            },
+        );
+        let nums_n = fbb.create_string("nums");
+        let nums_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(nums_n),
+                type_: Some(vec_int_t),
+                id: 2,
+                offset: 8,
+                ..Default::default()
+            },
+        );
+        let tags_n = fbb.create_string("tags");
+        let tags_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(tags_n),
+                type_: Some(vec_str_t),
+                id: 3,
+                offset: 10,
+                ..Default::default()
+            },
+        );
+        let bag_fields = fbb.create_vector(&[flags_f, items_f, nums_f, tags_f]);
+        let bag_n = fbb.create_string("Bag");
+        let bag = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(bag_n),
+                fields: Some(bag_fields),
+                ..Default::default()
+            },
+        );
+
+        // Objects sorted by name: Bag (0), Item (1).
+        let objects = fbb.create_vector(&[bag, item]);
+        let enums = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum>>(&[]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(bag),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// Build a `Bag` buffer. Each argument may be `None` to elide the
+    /// vector slot entirely (covers the absent-vector path); an
+    /// empty slice produces a present zero-length vector.
+    fn build_bag(
+        items: Option<&[&str]>,
+        tags: Option<&[&str]>,
+        nums: Option<&[i32]>,
+        flags: Option<&[bool]>,
+    ) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+
+        // Build vectors first so their offsets are known before we
+        // open the Bag table.
+        let items_off = items.map(|skus| {
+            // Each Item is its own table; build them, collect
+            // offsets, then create_vector over them.
+            let item_offs: Vec<_> = skus
+                .iter()
+                .map(|sku| {
+                    let sku_off = fbb.create_string(sku);
+                    let t = fbb.start_table();
+                    fbb.push_slot_always(4, sku_off);
+                    fbb.end_table(t)
+                })
+                .collect();
+            fbb.create_vector(&item_offs)
+        });
+        let tags_off = tags.map(|ts| {
+            let tag_offs: Vec<_> = ts.iter().map(|t| fbb.create_string(t)).collect();
+            fbb.create_vector(&tag_offs)
+        });
+        let nums_off = nums.map(|ns| fbb.create_vector(ns));
+        let flags_off = flags.map(|fs| fbb.create_vector(fs));
+
+        let t = fbb.start_table();
+        if let Some(off) = flags_off {
+            fbb.push_slot_always(4, off);
+        }
+        if let Some(off) = items_off {
+            fbb.push_slot_always(6, off);
+        }
+        if let Some(off) = nums_off {
+            fbb.push_slot_always(8, off);
+        }
+        if let Some(off) = tags_off {
+            fbb.push_slot_always(10, off);
+        }
+        let bag = fbb.end_table(t);
+        fbb.finish_minimal(bag);
+        fbb.finished_data().to_vec()
+    }
+
+    fn run_vec(query_str: &str, buf: &[u8], bfbs: &[u8]) -> Result<Option<String>, ExecuteError> {
+        let schema = root_as_schema(bfbs).expect("test schema verifies");
+        let query = parse(query_str).expect("test query parses");
+        execute(buf, &schema, &query, &Bounds::default())
+    }
+
+    // -- vector of strings --
+
+    #[test]
+    fn vector_string_index_in_range() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(None, Some(&["red", "green", "blue"]), None, None);
+        let v = run_vec("Bag:tags[0]", &buf, &bfbs).unwrap();
+        assert_eq!(v.as_deref(), Some("red"));
+        let v = run_vec("Bag:tags[2]", &buf, &bfbs).unwrap();
+        assert_eq!(v.as_deref(), Some("blue"));
+    }
+
+    #[test]
+    fn vector_string_index_out_of_bounds_returns_none() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(None, Some(&["red"]), None, None);
+        let v = run_vec("Bag:tags[99]", &buf, &bfbs).unwrap();
+        // Per design §4.3, OOB indices short-circuit to NULL —
+        // explicitly distinct from `ERROR`.
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn vector_string_empty_index_returns_none() {
+        let bfbs = build_vec_schema();
+        // Present-but-empty vector: vtable slot points to a Vector
+        // with length 0. Index 0 is OOB.
+        let buf = build_bag(None, Some(&[]), None, None);
+        let v = run_vec("Bag:tags[0]", &buf, &bfbs).unwrap();
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn vector_absent_vtable_slot_returns_none() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(None, None, None, None); // no slots set
+        let v = run_vec("Bag:tags[0]", &buf, &bfbs).unwrap();
+        assert!(v.is_none());
+    }
+
+    // -- vector of scalars --
+
+    #[test]
+    fn vector_int_index_in_range() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(None, None, Some(&[10, 20, 30]), None);
+        let v = run_vec("Bag:nums[1]", &buf, &bfbs).unwrap();
+        assert_eq!(v.as_deref(), Some("20"));
+    }
+
+    #[test]
+    fn vector_bool_renders_as_zero_or_one() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(None, None, None, Some(&[true, false]));
+        // Bool elements stringify via `u8::Display` → "0" / "1",
+        // matching the way scalar bool *fields* render through the
+        // upstream `get_any_field_string` path.
+        assert_eq!(
+            run_vec("Bag:flags[0]", &buf, &bfbs).unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            run_vec("Bag:flags[1]", &buf, &bfbs).unwrap().as_deref(),
+            Some("0")
+        );
+    }
+
+    // -- vector of tables --
+
+    #[test]
+    fn vector_of_tables_descend_then_string_leaf() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["ABC", "DEF", "GHI"]), None, None, None);
+        let v = run_vec("Bag:items[1].sku", &buf, &bfbs).unwrap();
+        assert_eq!(v.as_deref(), Some("DEF"));
+    }
+
+    #[test]
+    fn vector_of_tables_oob_then_field_returns_none() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["ABC"]), None, None, None);
+        let v = run_vec("Bag:items[5].sku", &buf, &bfbs).unwrap();
+        assert!(v.is_none());
+    }
+
+    // -- error paths --
+
+    #[test]
+    fn bare_vector_at_leaf_errors_with_unsupported_type() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(None, Some(&["x"]), None, None);
+        // `Bag:tags` (no `[i]`) has no v0.1 textual form.
+        let err = run_vec("Bag:tags", &buf, &bfbs).unwrap_err();
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedType { field, .. } if field == "tags"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vector_of_tables_element_at_leaf_errors_with_unsupported_type() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["ABC"]), None, None, None);
+        // `Bag:items[0]` would yield a sub-table value; can't
+        // stringify.
+        let err = run_vec("Bag:items[0]", &buf, &bfbs).unwrap_err();
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedType { field, .. } if field == "items"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn descend_through_scalar_vector_errors_with_unsupported_type() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(None, None, Some(&[1, 2, 3]), None);
+        // `nums[0].foo` — can't descend into a scalar element.
+        let err = run_vec("Bag:nums[0].foo", &buf, &bfbs).unwrap_err();
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedType { field, .. } if field == "nums"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vector_all_step_errors_with_unsupported_step() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(None, Some(&["a", "b"]), None, None);
+        // `Bag:tags[*]` — `Step::All` after a vector field is
+        // routed through `walk_vector` and rejected there until the
+        // fanout slice lands. (Distinct from the existing
+        // `vector_step_errors_with_unsupported_step` test, which
+        // covers a `Step::All` at the *root* of the path.)
+        let err = run_vec("Bag:tags[*]", &buf, &bfbs).unwrap_err();
+        assert!(
+            matches!(err, ExecuteError::UnsupportedStep { what: "[*]" }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vector_map_key_step_errors_with_unsupported_step() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["x"]), None, None, None);
+        let err = run_vec("Bag:items[abc].sku", &buf, &bfbs).unwrap_err();
+        assert!(
+            matches!(err, ExecuteError::UnsupportedStep { what: "[map-key]" }),
+            "got {err:?}"
+        );
     }
 }
