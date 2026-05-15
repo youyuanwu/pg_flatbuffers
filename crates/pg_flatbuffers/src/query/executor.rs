@@ -1,8 +1,24 @@
 //! Reflection-driven query executor (see `docs/design.md` §7.2).
 //!
 //! Consumes a parsed [`Query`] plus a registered [`Schema`] and a
-//! caller-supplied buffer, and produces the leaf value as a `String`
-//! (or `None` for SQL-NULL semantics).
+//! caller-supplied buffer, and produces a list of leaves as
+//! `Vec<Option<String>>`:
+//!
+//! - `Some(text)` for a present scalar / string leaf;
+//! - `None` for a leaf that the path traversal short-circuited at
+//!   (absent intermediate sub-table, absent string, absent vector
+//!   under `[i]`, …);
+//! - the list has length **1** for paths without `Step::All`,
+//!   length **N** for one `Step::All` over a vector of length N
+//!   (depth-first left-to-right for nested `[*]` per §7.2 step 3).
+//!   An absent vector or empty vector under `Step::All` produces
+//!   length **0**.
+//!
+//! The single-leaf wrappers (`flatbuffers_query`) take
+//! `result.into_iter().next().flatten()`; the array wrapper
+//! (`flatbuffers_query_array`) takes `result.into_iter().flatten()
+//! .collect()` (skipping `None` per design §4.3 "absent values are
+//! skipped").
 //!
 //! This module is the smallest viable executor: a starting point that
 //! the next slices grow into the full design. It supports paths that
@@ -12,17 +28,17 @@
 //! - Descent into sub-tables (`BaseType::Obj` where the referenced
 //!   `Object` is **not** a struct).
 //! - `Step::Index` for vector access (§7.2 step 2). Out-of-range
-//!   indices short-circuit to `Ok(None)` per design §4.3. Supported
-//!   element types: scalars, bool, string, and tables (descend with
-//!   the remaining steps).
+//!   indices short-circuit to a single `None` per design §4.3.
+//! - `Step::All` for vector fanout (§7.2 step 3). Emits one entry
+//!   per vector element in wire-format order. Supported element
+//!   types: scalars, bool, string, and tables (descend with the
+//!   remaining steps; nested `[*]` accumulates depth-first).
 //! - Stringification of scalar (int/uint/float/bool) and string leaves
 //!   via [`flatbuffers_reflection::get_any_field_string`].
 //!
 //! Deliberately deferred to dedicated micro-slices, each returning a
 //! clear [`ExecuteError::Unsupported*`] variant today:
 //!
-//! - `Step::All` — vector fanout (§7.2 step 3). Routed through
-//!   `walk_vector` and rejected there with `UnsupportedStep`.
 //! - `Step::MapKey`, `Step::MapKeys` — `(key)`-vector lookups
 //!   (§7.2 step 4/5).
 //! - Struct descent (bare and as vector elements) — needs a separate
@@ -99,9 +115,15 @@ pub enum ExecuteError {
     Internal(String),
 }
 
-/// Run `query` against `buf`. Returns the leaf value as `Some(text)`,
-/// or `None` for SQL-NULL semantics (field absent in the buffer or
-/// any intermediate sub-table absent).
+/// Run `query` against `buf`. Returns one entry per leaf produced by
+/// the path:
+///
+/// - For paths *without* `Step::All`, the result has length 1; the
+///   single entry is `Some(text)` for a present leaf or `None` when
+///   the path short-circuited at an absent intermediate / absent
+///   string / out-of-range index.
+/// - For paths with one `Step::All` over a vector of length N, the
+///   result has length N (or 0 if the vector is absent / empty).
 ///
 /// `bounds` plumbs the per-call resource limits from
 /// `docs/design.md` §10. The caller is responsible for sourcing them
@@ -112,7 +134,7 @@ pub fn execute(
     schema: &Schema<'_>,
     query: &Query,
     bounds: &Bounds,
-) -> Result<Option<String>, ExecuteError> {
+) -> Result<Vec<Option<String>>, ExecuteError> {
     // Verify first; every subsequent unchecked accessor relies on
     // this returning `Ok`.
     verify(buf, schema, bounds)?;
@@ -134,7 +156,8 @@ pub fn execute(
 // ---------------------------------------------------------------------------
 
 /// Walk the path `steps` starting from `table` (whose schema shape is
-/// `object`). Returns the leaf string, or `None` for SQL-NULL.
+/// `object`). Returns one or more leaves in wire-format order; see
+/// [`execute`] for the length contract.
 ///
 /// # Safety contract
 ///
@@ -146,7 +169,7 @@ fn walk_table(
     object: &Object,
     schema: &Schema,
     steps: &[Step],
-) -> Result<Option<String>, ExecuteError> {
+) -> Result<Vec<Option<String>>, ExecuteError> {
     let (head, tail) = steps
         .split_first()
         .expect("parser guarantees at least one step");
@@ -181,16 +204,20 @@ fn walk_table(
             | BaseType::Array
     );
 
-    if !is_present && is_nullable_type {
-        return Ok(None);
-    }
-
-    // Vector dispatch must come before the leaf/descent fork, because
-    // a vector field is *never* a leaf and *never* descends through
-    // `walk_table`: it consumes one extra path step (the indexer)
-    // before we know what to do next.
+    // Vector dispatch must come before *both* the absent-nullable
+    // short-circuit and the leaf/descent fork, because the
+    // `[i]` vs `[*]` distinction lives in `walk_vector`: an absent
+    // vector under `[i]` is `vec![None]` (one virtual entry), but
+    // under `[*]` it's `vec![]` (no items to fan out over).
+    // `walk_vector` handles both cases internally.
     if matches!(base_type, BaseType::Vector | BaseType::Vector64) {
         return walk_vector(table, &field, schema, tail);
+    }
+
+    if !is_present && is_nullable_type {
+        // One virtual leaf, value `None`. (Vector dispatch above
+        // already covered the vector-typed nullable case.)
+        return Ok(vec![None]);
     }
 
     if tail.is_empty() {
@@ -202,9 +229,9 @@ fn walk_table(
             // ourselves. (Required is enforced by the verifier; we
             // never reach here for `field.required() == true`
             // because verification would have failed.)
-            return Ok(Some(scalar_default_string(&field, base_type)));
+            return Ok(vec![Some(scalar_default_string(&field, base_type))]);
         }
-        return read_leaf(table, &field, schema, base_type);
+        return read_leaf(table, &field, schema, base_type).map(|opt| vec![opt]);
     }
 
     // Descent — only nested tables are supported in this slice.
@@ -237,7 +264,7 @@ fn walk_table(
                 // Defensive: vtable said present, but the deref
                 // returned None. Treat as absent rather than
                 // panicking.
-                None => Ok(None),
+                None => Ok(vec![None]),
             }
         }
         other => Err(ExecuteError::UnsupportedType {
@@ -256,19 +283,24 @@ fn walk_table(
 /// since the upstream verifier doesn't yet validate Vector64
 /// payloads). `steps` is the *remaining* path after the vector field
 /// itself; it must lead with one of `Step::Index`, `Step::All`,
-/// `Step::MapKey`, or `Step::MapKeys`. The latter three are deferred
+/// `Step::MapKey`, or `Step::MapKeys`. The latter two are deferred
 /// to dedicated micro-slices and rejected here with
 /// [`ExecuteError::UnsupportedStep`].
 ///
-/// Out-of-range indices return `Ok(None)` (design §4.3 "Path
-/// traversal short-circuits at out-of-range index"), distinct from
-/// "the vector itself was absent" which also returns `Ok(None)`.
+/// Length contract:
+///
+/// - `[i]` with absent / OOB / empty vector → `vec![None]` (one
+///   virtual entry; path traversal short-circuits).
+/// - `[*]` with absent / empty vector → `vec![]` (no items to fan
+///   out over, zero entries).
+/// - `[*]` with present length-N vector → N entries (depth-first
+///   left-to-right for nested `[*]` per §7.2 step 3).
 fn walk_vector(
     table: &Table,
     field: &Field,
     schema: &Schema,
     steps: &[Step],
-) -> Result<Option<String>, ExecuteError> {
+) -> Result<Vec<Option<String>>, ExecuteError> {
     let field_name = field.name();
 
     // Vector64 is in scope for the design but not for v0.1: the
@@ -296,37 +328,40 @@ fn walk_vector(
         }
     };
 
-    let idx = match head {
-        Step::Index(i) => *i,
-        Step::All => return Err(ExecuteError::UnsupportedStep { what: "[*]" }),
-        Step::MapKey(_) => return Err(ExecuteError::UnsupportedStep { what: "[map-key]" }),
-        Step::MapKeys => return Err(ExecuteError::UnsupportedStep { what: "|keys" }),
+    let element_base_type = field.type_().element();
+
+    match head {
+        Step::Index(idx) => {
+            walk_vector_at_index(table, field, schema, *idx, tail, element_base_type)
+        }
+        Step::All => walk_vector_all(table, field, schema, tail, element_base_type),
+        Step::MapKey(_) => Err(ExecuteError::UnsupportedStep { what: "[map-key]" }),
+        Step::MapKeys => Err(ExecuteError::UnsupportedStep { what: "|keys" }),
         // A `Step::Field` after a vector field is a parser bug — the
         // grammar requires an indexer right after the vector. Be
         // defensive in case the AST grows new arms.
-        Step::Field(_) => {
-            return Err(ExecuteError::Internal(format!(
-                "expected `[i]` / `[*]` / `[key]` / `|keys` after vector field {field_name:?}, \
-                 found a `Field` step"
-            )));
-        }
-    };
+        Step::Field(_) => Err(ExecuteError::Internal(format!(
+            "expected `[i]` / `[*]` / `[key]` / `|keys` after vector field {field_name:?}, \
+             found a `Field` step"
+        ))),
+    }
+}
 
-    let element_base_type = field.type_().element();
+/// Materialise a single indexed element. Out-of-range / absent →
+/// `vec![None]`. Element type `Obj` may consume more `tail` steps
+/// for descent; scalar / string element types must be at leaf.
+fn walk_vector_at_index(
+    table: &Table,
+    field: &Field,
+    schema: &Schema,
+    idx: usize,
+    tail: &[Step],
+    element_base_type: BaseType,
+) -> Result<Vec<Option<String>>, ExecuteError> {
+    let field_name = field.name();
 
-    // Vectors of tables are the only element type that *consumes*
-    // additional steps (descent into the indexed sub-table).
     if element_base_type == BaseType::Obj {
-        let child_index = field.type_().index();
-        if child_index < 0 {
-            return Err(ExecuteError::Internal(format!(
-                "vector field {field_name:?} has element BaseType::Obj but negative \
-                 object index ({child_index})"
-            )));
-        }
-        let child_object = schema.objects().get(
-            usize::try_from(child_index).expect("non-negative after the explicit < 0 guard above"),
-        );
+        let child_object = lookup_vector_element_object(field, schema)?;
         if child_object.is_struct() {
             // Vectors of inline structs need the same dedicated
             // walk_struct cursor as bare struct descent (deferred).
@@ -347,10 +382,10 @@ fn walk_vector(
             Some(v) => v,
             // Defensive: vtable said present but follow returned
             // None. Match the absent-vector contract.
-            None => return Ok(None),
+            None => return Ok(vec![None]),
         };
         if idx >= vec.len() {
-            return Ok(None);
+            return Ok(vec![None]);
         }
         let elem_table = vec.get(idx);
 
@@ -374,7 +409,88 @@ fn walk_vector(
             type_name: base_type_name(element_base_type),
         });
     }
-    read_vector_element(table, field, idx, element_base_type)
+    read_vector_element(table, field, idx, element_base_type).map(|opt| vec![opt])
+}
+
+/// Fan out across every element of `field` in wire-format order.
+/// Absent / empty vector → `vec![]`. For tables, recurse with `tail`
+/// per-element and concatenate (depth-first left-to-right per
+/// §7.2 step 3); for scalars / strings, `tail` must be empty and we
+/// stringify each element.
+fn walk_vector_all(
+    table: &Table,
+    field: &Field,
+    schema: &Schema,
+    tail: &[Step],
+    element_base_type: BaseType,
+) -> Result<Vec<Option<String>>, ExecuteError> {
+    let field_name = field.name();
+
+    if element_base_type == BaseType::Obj {
+        let child_object = lookup_vector_element_object(field, schema)?;
+        if child_object.is_struct() {
+            return Err(ExecuteError::UnsupportedType {
+                field: field_name.to_string(),
+                type_name: "vector of struct",
+            });
+        }
+
+        // SAFETY: see `execute`. Same Vector<ForwardsUOffset<Table>>
+        // shape as `walk_vector_at_index`.
+        let vec_opt = unsafe {
+            table.get::<ForwardsUOffset<Vector<ForwardsUOffset<Table>>>>(field.offset(), None)
+        };
+        let vec = match vec_opt {
+            Some(v) => v,
+            // Absent vector under `[*]` → no fanout, zero leaves.
+            None => return Ok(vec![]),
+        };
+
+        if tail.is_empty() {
+            return Err(ExecuteError::UnsupportedType {
+                field: field_name.to_string(),
+                type_name: "vector-of-table element (sub-table at leaf)",
+            });
+        }
+
+        // Pre-size to vec.len() as a floor; nested `[*]` may grow
+        // the result further per element.
+        let mut out: Vec<Option<String>> = Vec::with_capacity(vec.len());
+        for elem_table in vec.iter() {
+            let mut sub = walk_table(&elem_table, &child_object, schema, tail)?;
+            out.append(&mut sub);
+        }
+        return Ok(out);
+    }
+
+    // Scalar / string element types: must be the terminal step.
+    if !tail.is_empty() {
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: base_type_name(element_base_type),
+        });
+    }
+    read_vector_all(table, field, element_base_type)
+}
+
+/// Resolve the `Object` referenced by a vector-of-table field's
+/// `field.type_().index()`. Factored out because both the indexed
+/// and the fanout paths need it.
+fn lookup_vector_element_object<'a>(
+    field: &Field,
+    schema: &'a Schema,
+) -> Result<Object<'a>, ExecuteError> {
+    let child_index = field.type_().index();
+    if child_index < 0 {
+        return Err(ExecuteError::Internal(format!(
+            "vector field {:?} has element BaseType::Obj but negative object index ({})",
+            field.name(),
+            child_index
+        )));
+    }
+    Ok(schema.objects().get(
+        usize::try_from(child_index).expect("non-negative after the explicit < 0 guard above"),
+    ))
 }
 
 /// Stringify the `idx`-th element of a vector whose elements are
@@ -449,6 +565,59 @@ fn read_vector_element(
         }
         // Vectors of unions / vectors-of-vectors / vector-of-array
         // need their own slices.
+        other => Err(ExecuteError::UnsupportedType {
+            field: field.name().to_string(),
+            type_name: base_type_name(other),
+        }),
+    }
+}
+
+/// Stringify *every* element of a vector whose elements are scalars
+/// or strings, in wire-format order. Returns `Ok(vec![])` for an
+/// absent vector. Mirrors [`read_vector_element`] arm-for-arm so
+/// element formatting is identical.
+fn read_vector_all(
+    table: &Table,
+    field: &Field,
+    element_base_type: BaseType,
+) -> Result<Vec<Option<String>>, ExecuteError> {
+    macro_rules! scalar {
+        ($t:ty) => {{
+            // SAFETY: see `read_vector_element`.
+            let vec_opt =
+                unsafe { get_field_vector::<$t>(table, field) }.map_err(map_reflection_err)?;
+            let vec = match vec_opt {
+                Some(v) => v,
+                None => return Ok(vec![]),
+            };
+            Ok(vec.iter().map(|e| Some(e.to_string())).collect())
+        }};
+    }
+
+    match element_base_type {
+        BaseType::Bool | BaseType::UByte => scalar!(u8),
+        BaseType::Byte => scalar!(i8),
+        BaseType::Short => scalar!(i16),
+        BaseType::UShort => scalar!(u16),
+        BaseType::Int => scalar!(i32),
+        BaseType::UInt => scalar!(u32),
+        BaseType::Long => scalar!(i64),
+        BaseType::ULong => scalar!(u64),
+        BaseType::Float => scalar!(f32),
+        BaseType::Double => scalar!(f64),
+        BaseType::String => {
+            // SAFETY: see `read_vector_element` — same direct
+            // `table.get::<ForwardsUOffset<Vector<ForwardsUOffset<&str>>>>`
+            // workaround for the `Follow<Inner = Self>` bound.
+            let vec_opt = unsafe {
+                table.get::<ForwardsUOffset<Vector<ForwardsUOffset<&str>>>>(field.offset(), None)
+            };
+            let vec = match vec_opt {
+                Some(v) => v,
+                None => return Ok(vec![]),
+            };
+            Ok(vec.iter().map(|s| Some(s.to_string())).collect())
+        }
         other => Err(ExecuteError::UnsupportedType {
             field: field.name().to_string(),
             type_name: base_type_name(other),
@@ -794,7 +963,20 @@ mod tests {
         fbb.finished_data().to_vec()
     }
 
+    /// Test helper: execute and unwrap to the **first** leaf, the
+    /// shape that all the pre-`Step::All` tests assert against. The
+    /// new fanout tests use [`run_all`] to inspect the full vec.
     fn run(query_str: &str, buf: &[u8], bfbs: &[u8]) -> Result<Option<String>, ExecuteError> {
+        run_all(query_str, buf, bfbs).map(|v| v.into_iter().next().flatten())
+    }
+
+    /// Test helper: execute and return the full leaf vec. Mirrors
+    /// what `flatbuffers_query_array` would surface to SQL.
+    fn run_all(
+        query_str: &str,
+        buf: &[u8],
+        bfbs: &[u8],
+    ) -> Result<Vec<Option<String>>, ExecuteError> {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
         execute(buf, &schema, &query, &Bounds::default())
@@ -1177,7 +1359,18 @@ mod tests {
         fbb.finished_data().to_vec()
     }
 
+    /// Test helper: execute against the `Bag` schema and unwrap to
+    /// the first leaf. The fanout (`Step::All`) tests use
+    /// [`run_vec_all`] instead to inspect the whole vec.
     fn run_vec(query_str: &str, buf: &[u8], bfbs: &[u8]) -> Result<Option<String>, ExecuteError> {
+        run_vec_all(query_str, buf, bfbs).map(|v| v.into_iter().next().flatten())
+    }
+
+    fn run_vec_all(
+        query_str: &str,
+        buf: &[u8],
+        bfbs: &[u8],
+    ) -> Result<Vec<Option<String>>, ExecuteError> {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
         execute(buf, &schema, &query, &Bounds::default())
@@ -1307,18 +1500,130 @@ mod tests {
         );
     }
 
+    // -- Step::All fanout --
+
     #[test]
-    fn vector_all_step_errors_with_unsupported_step() {
+    fn vector_all_strings() {
         let bfbs = build_vec_schema();
-        let buf = build_bag(None, Some(&["a", "b"]), None, None);
-        // `Bag:tags[*]` — `Step::All` after a vector field is
-        // routed through `walk_vector` and rejected there until the
-        // fanout slice lands. (Distinct from the existing
-        // `vector_step_errors_with_unsupported_step` test, which
-        // covers a `Step::All` at the *root* of the path.)
-        let err = run_vec("Bag:tags[*]", &buf, &bfbs).unwrap_err();
+        let buf = build_bag(None, Some(&["red", "green", "blue"]), None, None);
+        let v = run_vec_all("Bag:tags[*]", &buf, &bfbs).expect("ok");
+        assert_eq!(
+            v,
+            vec![
+                Some("red".to_owned()),
+                Some("green".to_owned()),
+                Some("blue".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn vector_all_strings_empty_vector() {
+        let bfbs = build_vec_schema();
+        // tags is present but empty.
+        let buf = build_bag(None, Some(&[]), None, None);
+        let v = run_vec_all("Bag:tags[*]", &buf, &bfbs).expect("ok");
+        assert!(v.is_empty(), "got {v:?}");
+    }
+
+    #[test]
+    fn vector_all_strings_absent_vector() {
+        let bfbs = build_vec_schema();
+        // tags is absent (vtable slot 0).
+        let buf = build_bag(None, None, None, None);
+        let v = run_vec_all("Bag:tags[*]", &buf, &bfbs).expect("ok");
+        assert!(v.is_empty(), "got {v:?}");
+    }
+
+    #[test]
+    fn vector_all_scalar_ints() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(None, None, Some(&[10, 20, 30]), None);
+        let v = run_vec_all("Bag:nums[*]", &buf, &bfbs).expect("ok");
+        assert_eq!(
+            v,
+            vec![
+                Some("10".to_owned()),
+                Some("20".to_owned()),
+                Some("30".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn vector_all_scalar_bools() {
+        let bfbs = build_vec_schema();
+        // bool elements stringify as "1" / "0" to match
+        // `read_vector_element` (and the upstream
+        // `get_any_field_string` form for scalar bool fields).
+        let buf = build_bag(None, None, None, Some(&[true, false, true]));
+        let v = run_vec_all("Bag:flags[*]", &buf, &bfbs).expect("ok");
+        assert_eq!(
+            v,
+            vec![
+                Some("1".to_owned()),
+                Some("0".to_owned()),
+                Some("1".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn vector_all_table_field_descent() {
+        let bfbs = build_vec_schema();
+        // Three items with skus "a", "b", "c".
+        let buf = build_bag(Some(&["a", "b", "c"]), None, None, None);
+        let v = run_vec_all("Bag:items[*].sku", &buf, &bfbs).expect("ok");
+        assert_eq!(
+            v,
+            vec![
+                Some("a".to_owned()),
+                Some("b".to_owned()),
+                Some("c".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn vector_all_table_field_absent_intermediate() {
+        let bfbs = build_vec_schema();
+        // build_bag's items always set sku, so use empty-string sku
+        // to exercise the "present but empty" path; absent-sku
+        // requires a custom builder. The fanout still emits one
+        // entry per element regardless.
+        let buf = build_bag(Some(&["x", "", "y"]), None, None, None);
+        let v = run_vec_all("Bag:items[*].sku", &buf, &bfbs).expect("ok");
+        assert_eq!(
+            v,
+            vec![
+                Some("x".to_owned()),
+                Some("".to_owned()),
+                Some("y".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn vector_all_table_with_no_descent_errors() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["a"]), None, None, None);
+        // `Bag:items[*]` lands at a sub-table value with no textual
+        // form — same rationale as `Bag:items[0]`.
+        let err = run_vec_all("Bag:items[*]", &buf, &bfbs).unwrap_err();
         assert!(
-            matches!(err, ExecuteError::UnsupportedStep { what: "[*]" }),
+            matches!(&err, ExecuteError::UnsupportedType { field, .. } if field == "items"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vector_all_scalar_with_descent_errors() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(None, None, Some(&[1, 2, 3]), None);
+        // `Bag:nums[*].foo` — can't descend into a scalar element.
+        let err = run_vec_all("Bag:nums[*].foo", &buf, &bfbs).unwrap_err();
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedType { field, .. } if field == "nums"),
             "got {err:?}"
         );
     }

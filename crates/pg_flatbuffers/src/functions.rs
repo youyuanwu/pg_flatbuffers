@@ -17,14 +17,17 @@
 //! exists:
 //!
 //! - [`flatbuffers_query`] — single leaf, `text`.
+//! - [`flatbuffers_query_array`] — fanout / multi-leaf, `text[]`.
 //! - [`flatbuffers_verify`] — boolean, suitable for `CHECK`.
 //! - [`flatbuffers_root_type`] — diagnostic helper returning the
 //!   registered root-table name.
 //!
 //! ### Deliberately deferred (each gets its own micro-slice)
 //!
-//! - `flatbuffers_query_array` / `flatbuffers_query_multi` — need
-//!   `Step::All` and `Step::Index` in the executor.
+//! - `flatbuffers_query_multi` — needs SETOF wiring (one row per
+//!   leaf). The Vec-shaped executor result already supports it; the
+//!   pgrx [`SetOfIterator`] / [`TableIterator`] glue lives in its
+//!   own slice.
 //! - `flatbuffers_to_json{,_text}` and
 //!   `flatbuffers_from_json{,_text}` — live in a future
 //!   `json.rs` slice.
@@ -54,9 +57,10 @@ const DEFAULT_SCHEMA: &str = "default";
 // ---------------------------------------------------------------------------
 
 /// Run `query` against `buf` and return the first leaf as `text`, or
-/// `NULL` when the leaf is absent (`Option::None` from the executor)
-/// or when `buf` itself is empty (the "absent payload" contract,
-/// design §10).
+/// `NULL` when the leaf is absent (the executor produced `None`),
+/// when the executor produced *no* leaves (e.g. `[*]` over an absent
+/// vector, see [`crate::query::execute`]), or when `buf` itself is
+/// empty (the "absent payload" contract, design §10).
 ///
 /// `STRICT` so SQL `NULL` in either argument short-circuits to `NULL`
 /// without invoking the function — both arguments are required for
@@ -85,9 +89,51 @@ fn flatbuffers_query(query: &str, buf: &[u8]) -> Option<String> {
     let cached = lookup_schema(schema_name);
     let schema_view = cached.schema();
 
-    match execute(buf, &schema_view, &parsed, &Bounds::default()) {
+    let leaves = match execute(buf, &schema_view, &parsed, &Bounds::default()) {
         Ok(v) => v,
         Err(e) => error!("flatbuffers_query: {e}"),
+    };
+
+    // First leaf, regardless of present/absent. For paths without
+    // `Step::All` the Vec has length 1; for `[*]` over an empty /
+    // absent vector the Vec is empty and we fall through to `None`.
+    leaves.into_iter().next().flatten()
+}
+
+// ---------------------------------------------------------------------------
+// flatbuffers_query_array
+// ---------------------------------------------------------------------------
+
+/// Run `query` against `buf` and return all present leaves as a
+/// `text[]`. Absent leaves (the `None` entries in the executor's
+/// `Vec<Option<String>>` result) are skipped per design §4.3
+/// "absent values are skipped"; the SQL caller sees only present
+/// values, in wire-format order.
+///
+/// Returns the empty array `{}` (not SQL `NULL`) when `buf` is empty
+/// or the executor produces no leaves (e.g. `[*]` over an absent
+/// vector). This makes `array_length(... , 1)` return `NULL` for
+/// "no matches" — matching the way Postgres distinguishes "empty
+/// array" from "NULL array".
+///
+/// Same `STRICT` / `STABLE` / `parallel_safe` rationale as
+/// [`flatbuffers_query`]; same `ERROR`-on-verifier-failure contract.
+#[pg_extern(stable, parallel_safe, strict)]
+fn flatbuffers_query_array(query: &str, buf: &[u8]) -> Vec<String> {
+    if buf.is_empty() {
+        return Vec::new();
+    }
+
+    let parsed = parse(query)
+        .unwrap_or_else(|e| error!("flatbuffers_query_array: invalid query {query:?}: {e}"));
+
+    let schema_name = parsed.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
+    let cached = lookup_schema(schema_name);
+    let schema_view = cached.schema();
+
+    match execute(buf, &schema_view, &parsed, &Bounds::default()) {
+        Ok(v) => v.into_iter().flatten().collect(),
+        Err(e) => error!("flatbuffers_query_array: {e}"),
     }
 }
 
@@ -313,6 +359,79 @@ mod tests {
         fbb.finished_data().to_vec()
     }
 
+    /// Build a `B { tags: [string]; }` schema rooted at `B`. Used by
+    /// the `flatbuffers_query_array` tests to exercise `Step::All`
+    /// fanout end-to-end through SQL.
+    fn build_b_schema_bfbs() -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        use flatbuffers_reflection::reflection::{
+            BaseType, Enum, Field, FieldArgs, Object, ObjectArgs, Schema, SchemaArgs, Type,
+            TypeArgs,
+        };
+
+        let mut fbb = FlatBufferBuilder::new();
+        let tags_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::String,
+                ..Default::default()
+            },
+        );
+        let tags_name = fbb.create_string("tags");
+        let tags_field = Field::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(tags_name),
+                type_: Some(tags_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let fields = fbb.create_vector(&[tags_field]);
+        let b_name = fbb.create_string("B");
+        let b_obj = Object::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(b_name),
+                fields: Some(fields),
+                ..Default::default()
+            },
+        );
+        let objects = fbb.create_vector(&[b_obj]);
+        let enums = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum>>(&[]);
+        let schema = Schema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(b_obj),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// Build a `B { tags: <tags?> }` buffer. `None` elides the
+    /// vector; `Some(&[])` emits an empty vector.
+    fn build_b_buf(tags: Option<&[&str]>) -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        let mut fbb = FlatBufferBuilder::new();
+        let tags_off = tags.map(|ts| {
+            let offs: Vec<_> = ts.iter().map(|s| fbb.create_string(s)).collect();
+            fbb.create_vector(&offs)
+        });
+        let t = fbb.start_table();
+        if let Some(off) = tags_off {
+            fbb.push_slot_always(4, off);
+        }
+        let b = fbb.end_table(t);
+        fbb.finish_minimal(b);
+        fbb.finished_data().to_vec()
+    }
+
     /// Register `bfbs` as schema `name` rooted at `root_table` via
     /// SPI. Tests run as superuser (pgrx-tests default), so the role
     /// check on `flatbuffers_schemas` is bypassed.
@@ -399,6 +518,90 @@ mod tests {
             &[build_t_buf(1).into()],
         )
         .expect("SPI failure");
+    }
+
+    // -- flatbuffers_query_array --
+
+    /// `STRICT` short-circuits NULL inputs.
+    #[pg_test]
+    fn pg_query_array_null_buf_returns_null() {
+        // Result is the SQL NULL array, *not* an empty array — STRICT
+        // bypasses the function body entirely. (`text[]` arrives back
+        // as `Vec<Option<String>>` so the outer Option is the
+        // array-level NULL.)
+        let v = Spi::get_one::<Vec<Option<String>>>(
+            "SELECT flatbuffers_query_array('B:tags[*]', NULL::bytea)",
+        )
+        .expect("SPI failure");
+        assert!(v.is_none(), "expected NULL, got {v:?}");
+    }
+
+    /// Empty `bytea` short-circuits to the empty array (not NULL,
+    /// not ERROR). Mirrors §10's "absent payload" sentinel; downstream
+    /// SQL using `array_length(... , 1)` will see `NULL` for the
+    /// "no matches" cardinality.
+    #[pg_test]
+    fn pg_query_array_empty_buf_returns_empty_array() {
+        let v = Spi::get_one::<Vec<Option<String>>>(
+            "SELECT flatbuffers_query_array('B:tags[*]', ''::bytea)",
+        )
+        .expect("SPI failure")
+        .expect("empty bytea must produce empty array, not NULL");
+        assert!(v.is_empty(), "got {v:?}");
+    }
+
+    /// Happy-path fanout: three tags → a three-element `text[]`,
+    /// preserving wire order.
+    #[pg_test]
+    fn pg_query_array_happy_path_strings() {
+        register("default", "B", build_b_schema_bfbs());
+        let buf = build_b_buf(Some(&["red", "green", "blue"]));
+        let v = Spi::get_one_with_args::<Vec<Option<String>>>(
+            "SELECT flatbuffers_query_array('B:tags[*]', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure")
+        .expect("NULL from happy path");
+        assert_eq!(
+            v,
+            vec![
+                Some("red".to_owned()),
+                Some("green".to_owned()),
+                Some("blue".to_owned()),
+            ],
+        );
+    }
+
+    /// Absent vector under `[*]` must be the empty array (no items
+    /// to fan out over) — distinct from `[i]` which would yield a
+    /// one-element NULL array.
+    #[pg_test]
+    fn pg_query_array_absent_vector_is_empty_array() {
+        register("default", "B", build_b_schema_bfbs());
+        let buf = build_b_buf(None);
+        let v = Spi::get_one_with_args::<Vec<Option<String>>>(
+            "SELECT flatbuffers_query_array('B:tags[*]', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure")
+        .expect("absent vector must be empty array, not NULL");
+        assert!(v.is_empty(), "got {v:?}");
+    }
+
+    /// `flatbuffers_query` returning the *first* leaf — we now
+    /// share the executor result with `flatbuffers_query_array`, so
+    /// pin the contract that `_query` against `[*]` collapses to the
+    /// first element.
+    #[pg_test]
+    fn pg_query_first_leaf_under_all() {
+        register("default", "B", build_b_schema_bfbs());
+        let buf = build_b_buf(Some(&["alpha", "beta"]));
+        let v = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('B:tags[*]', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure");
+        assert_eq!(v.as_deref(), Some("alpha"));
     }
 
     // -- flatbuffers_verify --
