@@ -56,7 +56,7 @@
 //! Pure Rust; no `pgrx` dependency. The Postgres SQL wrappers live in
 //! `functions.rs` (next slice).
 
-use super::ast::{FieldRef, Query, Step};
+use super::ast::{FieldRef, MapKey, Query, Step};
 use crate::verify::VerifyError;
 use crate::verify::{verify, Bounds};
 use flatbuffers::{ForwardsUOffset, Table, Vector};
@@ -335,7 +335,9 @@ fn walk_vector(
             walk_vector_at_index(table, field, schema, *idx, tail, element_base_type)
         }
         Step::All => walk_vector_all(table, field, schema, tail, element_base_type),
-        Step::MapKey(_) => Err(ExecuteError::UnsupportedStep { what: "[map-key]" }),
+        Step::MapKey(key) => {
+            walk_vector_at_map_key(table, field, schema, key, tail, element_base_type)
+        }
         Step::MapKeys => Err(ExecuteError::UnsupportedStep { what: "|keys" }),
         // A `Step::Field` after a vector field is a parser bug — the
         // grammar requires an indexer right after the vector. Be
@@ -491,6 +493,189 @@ fn lookup_vector_element_object<'a>(
     Ok(schema.objects().get(
         usize::try_from(child_index).expect("non-negative after the explicit < 0 guard above"),
     ))
+}
+
+/// Resolve the `(key)`-annotated field on `child_object` (the table
+/// type of vector elements). FlatBuffers guarantees at most one
+/// `(key)` field per table; we still error explicitly if zero are
+/// found, so the caller can surface a "not a keyed vector" message
+/// rather than silently returning no match.
+fn lookup_keyed_field<'a>(child_object: &'a Object) -> Result<Field<'a>, ExecuteError> {
+    let fields = child_object.fields();
+    let mut found: Option<Field<'a>> = None;
+    for i in 0..fields.len() {
+        let f = fields.get(i);
+        if f.key() {
+            // flatc rejects multi-key tables at schema-compile time,
+            // so we only need to defend against malformed `.bfbs`.
+            if found.is_some() {
+                return Err(ExecuteError::Internal(format!(
+                    "table {:?} has more than one (key)-annotated field",
+                    child_object.name()
+                )));
+            }
+            found = Some(f);
+        }
+    }
+    found.ok_or_else(|| ExecuteError::UnsupportedType {
+        field: child_object.name().to_string(),
+        type_name: "vector of tables with no (key)-annotated field",
+    })
+}
+
+/// Compare the `(key)`-annotated field on `elem` against the AST
+/// literal `key`. Returns `Ok(true)` on a match, `Ok(false)` on a
+/// non-match (including type-mismatch combinations like a textual
+/// key against an integer field that fails to parse), and `Err` for
+/// genuinely unsupported keyed-field types.
+///
+/// This slice supports `(key)` fields whose type is `String` or any
+/// signed/unsigned integer width. `Float` / `Double` / `Bool` keyed
+/// fields are deferred — they're permitted by the FlatBuffers spec
+/// but vanishingly rare in practice and would need additional
+/// stringification rules to round-trip cleanly.
+fn key_matches(
+    elem: &Table,
+    keyed_field: &Field,
+    schema: &Schema,
+    key: &MapKey,
+) -> Result<bool, ExecuteError> {
+    let kbase = keyed_field.type_().base_type();
+
+    // For both string and integer keyed fields the `(key)` field is
+    // by convention `required` (flatc enforces this), so the
+    // schema-default fallback in `get_any_field_string` never fires
+    // for a well-formed buffer.
+    //
+    // SAFETY: the buffer was verified by `execute`, and `keyed_field`
+    // came from the schema's reflected `Object.fields()`.
+    let actual = unsafe { get_any_field_string(elem, keyed_field, schema) };
+
+    match (kbase, key) {
+        (BaseType::String, MapKey::Text(s)) => Ok(actual == *s),
+        // A textual key against a string field that the AST already
+        // promoted to `Int` is a non-match, not an error: the user
+        // asked for a numeric value where the schema demands a string.
+        (BaseType::String, MapKey::Int(_)) => Ok(false),
+
+        // Integer keyed field. The parser only ever emits
+        // `MapKey::Text` (see `ast.rs`), so the common path is text
+        // → int parse. We compare numerically (rather than as
+        // formatted decimals) to dodge leading-zero / sign-formatting
+        // ambiguities — `[042]` and `[42]` both match a stored 42.
+        (b, MapKey::Text(s)) if is_integer_base(b) => {
+            let want: i64 = match s.parse::<i64>() {
+                Ok(n) => n,
+                // Non-numeric key against an integer field: the user
+                // asked for a key the field cannot hold. Treat as
+                // "no match" rather than an error so a typo at the
+                // SQL site surfaces as `NULL` (consistent with the
+                // OOB-index short-circuit) rather than aborting the
+                // whole statement.
+                Err(_) => return Ok(false),
+            };
+            // ULong values above i64::MAX would underflow this parse
+            // and silently no-match; that's a known v0.1 limitation
+            // documented at the call site.
+            Ok(actual.parse::<i64>().map(|v| v == want).unwrap_or(false))
+        }
+        (b, MapKey::Int(n)) if is_integer_base(b) => {
+            Ok(actual.parse::<i64>().map(|v| v == *n).unwrap_or(false))
+        }
+
+        // Float / Double / Bool / nested table / vector / union /
+        // array keyed fields are out of scope for this slice.
+        _ => Err(ExecuteError::UnsupportedType {
+            field: keyed_field.name().to_string(),
+            type_name: base_type_name(kbase),
+        }),
+    }
+}
+
+/// All integer-width FlatBuffers scalars (signed and unsigned). The
+/// `(key)` annotation supports any of them per the FlatBuffers spec.
+fn is_integer_base(b: BaseType) -> bool {
+    matches!(
+        b,
+        BaseType::Byte
+            | BaseType::UByte
+            | BaseType::Short
+            | BaseType::UShort
+            | BaseType::Int
+            | BaseType::UInt
+            | BaseType::Long
+            | BaseType::ULong
+    )
+}
+
+/// `field[abc]` — find the entry whose `(key)`-annotated field
+/// equals `key` (linear scan, first match in wire order). The
+/// design (§7.2 step 4) calls for binary search over `(key)`-sorted
+/// vectors, but that's gated on a verifier check that the vector is
+/// actually sorted. Until that check lands, we use the
+/// `pg_flatbuffers.key_lookup_strict = off` semantics from §10
+/// unconditionally — correct on any buffer, just O(n) per lookup.
+///
+/// On miss / absent / empty vector, returns `vec![None]` (path
+/// short-circuits, matching `Step::Index`'s OOB behaviour).
+fn walk_vector_at_map_key(
+    table: &Table,
+    field: &Field,
+    schema: &Schema,
+    key: &MapKey,
+    tail: &[Step],
+    element_base_type: BaseType,
+) -> Result<Vec<Option<String>>, ExecuteError> {
+    let field_name = field.name();
+
+    // Map-key lookup is only defined over vectors of `(key)`-
+    // annotated tables. Scalar / string vectors don't have a "key"
+    // distinct from the element value, so refuse rather than
+    // silently treat the literal as an index.
+    if element_base_type != BaseType::Obj {
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: base_type_name(element_base_type),
+        });
+    }
+
+    let child_object = lookup_vector_element_object(field, schema)?;
+    if child_object.is_struct() {
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: "vector of struct",
+        });
+    }
+
+    let keyed_field = lookup_keyed_field(&child_object)?;
+
+    if tail.is_empty() {
+        // `items[abc]` lands at a sub-table value with no v0.1
+        // textual form. Same rationale as `items[3]` /
+        // `items[*]` (no `.field` continuation).
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: "vector-of-table element (sub-table at leaf)",
+        });
+    }
+
+    // SAFETY: see `execute`. Same `Vector<ForwardsUOffset<Table>>`
+    // shape used by `walk_vector_at_index` / `walk_vector_all`.
+    let vec_opt = unsafe {
+        table.get::<ForwardsUOffset<Vector<ForwardsUOffset<Table>>>>(field.offset(), None)
+    };
+    let vec = match vec_opt {
+        Some(v) => v,
+        None => return Ok(vec![None]),
+    };
+
+    for elem in vec.iter() {
+        if key_matches(&elem, &keyed_field, schema, key)? {
+            return walk_table(&elem, &child_object, schema, tail);
+        }
+    }
+    // No element matched — short-circuit, same as out-of-range index.
+    Ok(vec![None])
 }
 
 /// Stringify the `idx`-th element of a vector whose elements are
@@ -1177,6 +1362,10 @@ mod tests {
         );
 
         // -- Item.sku: string (single-field table) --
+        // Marked `(key)` so the `Step::MapKey` tests can do
+        // `Bag:items[abc].sku` lookups against this fixture. The
+        // existing `[i]` and `[*]` tests don't observe the `key`
+        // flag, so this annotation is non-breaking for them.
         let sku_n = fbb.create_string("sku");
         let sku_f = RField::create(
             &mut fbb,
@@ -1185,6 +1374,7 @@ mod tests {
                 type_: Some(str_t),
                 id: 0,
                 offset: 4,
+                key: true,
                 ..Default::default()
             },
         );
@@ -1628,13 +1818,78 @@ mod tests {
         );
     }
 
+    // -- Step::MapKey --
+
     #[test]
-    fn vector_map_key_step_errors_with_unsupported_step() {
+    fn vector_map_key_hit() {
         let bfbs = build_vec_schema();
-        let buf = build_bag(Some(&["x"]), None, None, None);
-        let err = run_vec("Bag:items[abc].sku", &buf, &bfbs).unwrap_err();
+        let buf = build_bag(Some(&["a", "b", "c"]), None, None, None);
+        // Linear scan finds the element whose `(key)`-annotated
+        // `sku` field equals "b", then descends with `.sku` to
+        // stringify it.
+        let v = run_vec("Bag:items[b].sku", &buf, &bfbs).expect("ok");
+        assert_eq!(v.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn vector_map_key_first_hit_in_wire_order() {
+        let bfbs = build_vec_schema();
+        // Two entries with sku = "dup": linear scan returns the
+        // first in wire order (matching the §10
+        // `key_lookup_strict = off` fallback semantics that this
+        // slice ships unconditionally).
+        let buf = build_bag(Some(&["dup", "x", "dup"]), None, None, None);
+        let v = run_vec("Bag:items[dup].sku", &buf, &bfbs).expect("ok");
+        assert_eq!(v.as_deref(), Some("dup"));
+    }
+
+    #[test]
+    fn vector_map_key_miss_returns_none() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["a", "b"]), None, None, None);
+        let v = run_vec("Bag:items[zzz].sku", &buf, &bfbs).expect("ok");
+        assert!(v.is_none(), "got {v:?}");
+    }
+
+    #[test]
+    fn vector_map_key_empty_vector_returns_none() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&[]), None, None, None);
+        let v = run_vec("Bag:items[abc].sku", &buf, &bfbs).expect("ok");
+        assert!(v.is_none(), "got {v:?}");
+    }
+
+    #[test]
+    fn vector_map_key_absent_vector_returns_none() {
+        let bfbs = build_vec_schema();
+        // items field elided entirely.
+        let buf = build_bag(None, None, None, None);
+        let v = run_vec("Bag:items[abc].sku", &buf, &bfbs).expect("ok");
+        assert!(v.is_none(), "got {v:?}");
+    }
+
+    #[test]
+    fn vector_map_key_against_scalar_vector_errors() {
+        let bfbs = build_vec_schema();
+        // `tags` is a vector of strings, not a vector of tables;
+        // map-key lookup isn't defined for it.
+        let buf = build_bag(None, Some(&["a", "b"]), None, None);
+        let err = run_vec("Bag:tags[a]", &buf, &bfbs).unwrap_err();
         assert!(
-            matches!(err, ExecuteError::UnsupportedStep { what: "[map-key]" }),
+            matches!(&err, ExecuteError::UnsupportedType { field, .. } if field == "tags"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vector_map_key_no_descent_errors() {
+        let bfbs = build_vec_schema();
+        // `Bag:items[abc]` lands at a sub-table value with no v0.1
+        // textual form — same rationale as `Bag:items[0]`.
+        let buf = build_bag(Some(&["abc"]), None, None, None);
+        let err = run_vec("Bag:items[abc]", &buf, &bfbs).unwrap_err();
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedType { field, .. } if field == "items"),
             "got {err:?}"
         );
     }

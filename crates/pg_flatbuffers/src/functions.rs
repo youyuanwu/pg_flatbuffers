@@ -475,6 +475,119 @@ mod tests {
         fbb.finished_data().to_vec()
     }
 
+    /// Build a `Catalog { entries: [Entry]; }` schema where
+    /// `Entry { name: string (key); }` exists specifically so the
+    /// `flatbuffers_query` SQL tests can exercise `Step::MapKey`.
+    /// Object index 0 is `Catalog`, 1 is `Entry` (alphabetical).
+    fn build_catalog_schema_bfbs() -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        use flatbuffers_reflection::reflection::{
+            BaseType, Enum, Field, FieldArgs, Object, ObjectArgs, Schema, SchemaArgs, Type,
+            TypeArgs,
+        };
+
+        let mut fbb = FlatBufferBuilder::new();
+
+        // Entry.name: string (key)
+        let str_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::String,
+                ..Default::default()
+            },
+        );
+        let name_n = fbb.create_string("name");
+        let name_f = Field::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(name_n),
+                type_: Some(str_t),
+                id: 0,
+                offset: 4,
+                key: true,
+                ..Default::default()
+            },
+        );
+        let entry_fields = fbb.create_vector(&[name_f]);
+        let entry_n = fbb.create_string("Entry");
+        let entry = Object::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(entry_n),
+                fields: Some(entry_fields),
+                ..Default::default()
+            },
+        );
+
+        // Catalog.entries: [Entry]
+        let vec_entry_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::Obj,
+                index: 1, // Entry's index in the sorted objects vector
+                ..Default::default()
+            },
+        );
+        let entries_n = fbb.create_string("entries");
+        let entries_f = Field::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(entries_n),
+                type_: Some(vec_entry_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let cat_fields = fbb.create_vector(&[entries_f]);
+        let cat_n = fbb.create_string("Catalog");
+        let catalog = Object::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(cat_n),
+                fields: Some(cat_fields),
+                ..Default::default()
+            },
+        );
+
+        // Sort by name: Catalog (0), Entry (1).
+        let objects = fbb.create_vector(&[catalog, entry]);
+        let enums = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum>>(&[]);
+        let schema = Schema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(catalog),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// Build a `Catalog` buffer with one `Entry` per supplied name.
+    fn build_catalog_buf(names: &[&str]) -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        let mut fbb = FlatBufferBuilder::new();
+        let entry_offs: Vec<_> = names
+            .iter()
+            .map(|n| {
+                let name_off = fbb.create_string(n);
+                let t = fbb.start_table();
+                fbb.push_slot_always(4, name_off);
+                fbb.end_table(t)
+            })
+            .collect();
+        let entries_off = fbb.create_vector(&entry_offs);
+        let t = fbb.start_table();
+        fbb.push_slot_always(4, entries_off);
+        let cat = fbb.end_table(t);
+        fbb.finish_minimal(cat);
+        fbb.finished_data().to_vec()
+    }
+
     /// Register `bfbs` as schema `name` rooted at `root_table` via
     /// SPI. Tests run as superuser (pgrx-tests default), so the role
     /// check on `flatbuffers_schemas` is bypassed.
@@ -645,6 +758,38 @@ mod tests {
         )
         .expect("SPI failure");
         assert_eq!(v.as_deref(), Some("alpha"));
+    }
+
+    /// `Step::MapKey` end-to-end: lookup `Catalog:entries[beta].name`
+    /// against a `Catalog` whose `Entry.name` is the `(key)` field.
+    /// This is the SQL-side smoke for the executor's
+    /// `walk_vector_at_map_key` (full unit coverage of hits, misses,
+    /// empty / absent vectors, etc. lives in the executor module).
+    #[pg_test]
+    fn pg_query_map_key_hit() {
+        register("default", "Catalog", build_catalog_schema_bfbs());
+        let buf = build_catalog_buf(&["alpha", "beta", "gamma"]);
+        let v = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Catalog:entries[beta].name', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure");
+        assert_eq!(v.as_deref(), Some("beta"));
+    }
+
+    /// Map-key miss surfaces as SQL `NULL` rather than `ERROR` —
+    /// matches the OOB-index short-circuit so a typo on the SQL
+    /// side doesn't abort the statement.
+    #[pg_test]
+    fn pg_query_map_key_miss_returns_null() {
+        register("default", "Catalog", build_catalog_schema_bfbs());
+        let buf = build_catalog_buf(&["alpha", "gamma"]);
+        let v = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Catalog:entries[zzz].name', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure");
+        assert!(v.is_none(), "got {v:?}");
     }
 
     // -- flatbuffers_query_multi --
