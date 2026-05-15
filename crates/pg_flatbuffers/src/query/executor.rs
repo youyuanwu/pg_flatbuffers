@@ -43,6 +43,11 @@
 //!   rejected loudly. The auto-generated discriminator field
 //!   (`<name>_type`, `BaseType::UType`) is queryable as a `u8`
 //!   scalar leaf so callers can introspect the active variant.
+//! - `Step::UnionType` (the `|type` terminal). Yields the *name* of
+//!   the active union variant as a string leaf (e.g. `"TableA"`,
+//!   `"NONE"`). Symmetric with the `<name>_type` UType scalar but
+//!   enum-name rather than numeric. Absent / NONE returns the name
+//!   of the value-0 variant (typically `"NONE"`), not SQL NULL.
 //! - `Step::Index` for vector access (§7.2 step 2). Out-of-range
 //!   indices short-circuit to a single `None` per design §4.3.
 //! - `Step::All` for vector fanout (§7.2 step 3). Emits one entry
@@ -203,10 +208,33 @@ fn walk_table(
         Step::All => return Err(ExecuteError::UnsupportedStep { what: "[*]" }),
         Step::MapKey(_) => return Err(ExecuteError::UnsupportedStep { what: "[map-key]" }),
         Step::MapKeys => return Err(ExecuteError::UnsupportedStep { what: "|keys" }),
+        Step::UnionType => return Err(ExecuteError::UnsupportedStep { what: "|type" }),
     };
 
     let field_name = field.name();
     let base_type = field.type_().base_type();
+
+    // `|type` is a tail-position leaf marker on a union value
+    // field: it yields the *name* of the active variant ("TableA",
+    // "NONE", …) rather than its numeric discriminator (which is
+    // available on the auto-generated `<field>_type` UType scalar).
+    // Intercepted ahead of the absent-nullable short-circuit so
+    // that an absent / NONE union still returns the variant name
+    // ("NONE") rather than SQL NULL — symmetric with how
+    // `<field>_type` returns "0" for an absent discriminator.
+    if let [Step::UnionType, more @ ..] = tail {
+        if base_type != BaseType::Union {
+            return Err(ExecuteError::UnsupportedStep {
+                what: "|type (only valid on union fields)",
+            });
+        }
+        if !more.is_empty() {
+            return Err(ExecuteError::UnsupportedStep {
+                what: "|type (terminal — cannot descend further)",
+            });
+        }
+        return read_union_type_leaf(table, &field, schema);
+    }
 
     // Presence check via vtable: vtable.get(offset) == 0 means the
     // field is absent in this table instance. This is how we map
@@ -377,6 +405,11 @@ fn walk_vector(
             walk_vector_at_map_key(table, field, schema, key, tail, element_base_type)
         }
         Step::MapKeys => walk_vector_map_keys(table, field, schema, tail, element_base_type),
+        // `|type` makes no sense on a vector field — vectors aren't
+        // unions. Reject explicitly so the AST stays exhaustive.
+        Step::UnionType => Err(ExecuteError::UnsupportedStep {
+            what: "|type (only valid on union fields)",
+        }),
         // A `Step::Field` after a vector field is a parser bug — the
         // grammar requires an indexer right after the vector. Be
         // defensive in case the AST grows new arms.
@@ -853,6 +886,12 @@ fn walk_struct(
                 type_name: "|keys inside a struct (structs hold no vectors)",
             });
         }
+        Step::UnionType => {
+            return Err(ExecuteError::UnsupportedType {
+                field: object_name.to_string(),
+                type_name: "|type inside a struct (structs hold no unions)",
+            });
+        }
     };
 
     let field = find_field(object, field_ref)?;
@@ -1110,6 +1149,69 @@ fn walk_union(
         // rather than panicking on a misclassified malformed buffer.
         None => Ok(vec![None]),
     }
+}
+
+/// Read the active variant *name* of a union field as a single
+/// string leaf (e.g. `"TableA"`, `"NONE"`). Used by the `|type`
+/// terminal step. Mirrors the discriminator-resolution prelude of
+/// [`walk_union`] but never descends into the value sub-table.
+///
+/// Unlike the descent path, an absent / NONE union does **not**
+/// short-circuit to SQL NULL: it returns the variant name `"NONE"`
+/// (or whatever the schema's value-0 enum entry is named) so callers
+/// can `WHERE flatbuffers_query('Msg:body|type', buf) = 'NONE'`
+/// without juggling NULLs.
+fn read_union_type_leaf(
+    table: &Table,
+    value_field: &Field,
+    schema: &Schema,
+) -> Result<Vec<Option<String>>, ExecuteError> {
+    let field_name = value_field.name();
+    let value_slot = value_field.offset();
+    let disc_slot = match value_slot.checked_sub(2) {
+        Some(s) => s,
+        None => {
+            return Err(ExecuteError::Internal(format!(
+                "union value field {field_name:?} has vtable offset {value_slot}; \
+                 expected ≥2 to leave room for the discriminator slot"
+            )));
+        }
+    };
+
+    // SAFETY: see `execute`. The verifier validated the discriminator
+    // slot, when present, holds a valid `u8` union tag for the enum.
+    let disc = unsafe { table.get::<u8>(disc_slot, Some(0)) }.unwrap_or(0);
+
+    let enum_index = value_field.type_().index();
+    if enum_index < 0 {
+        return Err(ExecuteError::Internal(format!(
+            "schema field {field_name:?} has BaseType::Union but negative \
+             enum index ({enum_index})"
+        )));
+    }
+    let enum_idx =
+        usize::try_from(enum_index).expect("non-negative after the explicit < 0 guard above");
+    let enums = schema.enums();
+    if enum_idx >= enums.len() {
+        return Err(ExecuteError::Internal(format!(
+            "schema field {field_name:?} references enum index {enum_idx} \
+             but schema has only {} enums",
+            enums.len()
+        )));
+    }
+    let enum_def = enums.get(enum_idx);
+    let variant = enum_def
+        .values()
+        .lookup_by_key(disc as i64, |v, k| v.key_compare_with_value(*k))
+        .ok_or_else(|| {
+            ExecuteError::Internal(format!(
+                "union field {field_name:?} discriminator {disc} not found in \
+                 enum {:?}",
+                enum_def.name()
+            ))
+        })?;
+
+    Ok(vec![Some(variant.name().to_string())])
 }
 
 /// Stringify the `idx`-th element of a vector whose elements are
@@ -3405,6 +3507,96 @@ mod tests {
         let err = run_union_err("Msg:body|keys", &buf, &bfbs);
         assert!(
             matches!(&err, ExecuteError::UnsupportedStep { what } if *what == "|keys"),
+            "got {err:?}"
+        );
+    }
+
+    // -- `|type` (Step::UnionType) tests --
+
+    #[test]
+    fn union_type_leaf_returns_variant_name_a() {
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::A("hello"));
+        // `body|type` reads the discriminator and yields the
+        // EnumVal name (the symbolic variant name) — string leaf.
+        assert_eq!(
+            run_union("Msg:body|type", &buf, &bfbs).unwrap(),
+            Some("A".to_string())
+        );
+    }
+
+    #[test]
+    fn union_type_leaf_returns_variant_name_b() {
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::B(99));
+        assert_eq!(
+            run_union("Msg:body|type", &buf, &bfbs).unwrap(),
+            Some("B".to_string())
+        );
+    }
+
+    #[test]
+    fn union_type_leaf_for_none_returns_none_name() {
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::None);
+        // Discriminator absent → 0 → NONE EnumVal. Returns its
+        // *name* (not SQL NULL) so the row stays filterable in SQL.
+        // Symmetric with `body_type` returning "0" for absent.
+        assert_eq!(
+            run_union("Msg:body|type", &buf, &bfbs).unwrap(),
+            Some("NONE".to_string())
+        );
+    }
+
+    #[test]
+    fn union_type_on_non_union_field_errors() {
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::A("x"));
+        // `body_type` is a UType scalar, not a union. `|type` is
+        // only meaningful on `BaseType::Union` fields.
+        let err = run_union_err("Msg:body_type|type", &buf, &bfbs);
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedStep { what }
+                if what.starts_with("|type") && what.contains("only valid on union")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn union_type_with_descent_after_errors() {
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::A("x"));
+        // `|type` is a terminal leaf — descending past it is a
+        // type-shape error. Parser allows the syntactic shape;
+        // executor rejects it (mirrors the `|keys.foo` policy).
+        let err = run_union_err("Msg:body|type.x", &buf, &bfbs);
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedStep { what }
+                if what.starts_with("|type") && what.contains("terminal")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn union_type_at_root_errors() {
+        // `Msg:|type` would mean "type of the root" — but the root
+        // isn't a union. The parser produces a Step::UnionType as
+        // the first step; walk_table's head match rejects it.
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::A("x"));
+        // The parser rejects an empty identifier before `|`; we
+        // simulate the executor-side path by constructing the AST
+        // directly. (`Msg:|type` parses as `EmptyComponent` /
+        // `ExpectedIdentifier`, never reaching the executor.)
+        let schema = root_as_schema(&bfbs).expect("test schema verifies");
+        let query = Query {
+            schema: None,
+            root: "Msg".to_string(),
+            steps: vec![Step::UnionType],
+        };
+        let err = execute(&buf, &schema, &query, &Bounds::default()).unwrap_err();
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedStep { what } if *what == "|type"),
             "got {err:?}"
         );
     }

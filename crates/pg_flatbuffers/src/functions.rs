@@ -1301,6 +1301,22 @@ mod tests {
         assert_eq!(v.as_deref(), Some("hello"));
     }
 
+    /// SQL-side smoke for the `|type` terminal: returns the active
+    /// variant's symbolic name as a string. Full coverage of NONE
+    /// handling, non-union rejection, and descent-past-leaf
+    /// rejection lives in the executor module.
+    #[pg_test]
+    fn pg_query_union_type_returns_variant_name() {
+        register("default", "Msg", build_msg_schema_bfbs());
+        let buf = build_msg_buf_a("hello");
+        let v = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Msg:body|type', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure");
+        assert_eq!(v.as_deref(), Some("A"));
+    }
+
     // -- flatbuffers_query_multi --
 
     /// `STRICT` short-circuits NULL inputs \u2014 zero rows, never the

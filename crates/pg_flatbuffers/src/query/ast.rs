@@ -50,6 +50,13 @@ pub enum Step {
     /// `field|keys` — enumerate the key field of a `(key)`-annotated
     /// vector.
     MapKeys,
+    /// `field|type` — yield the **name** of the active variant of a
+    /// union field as a string leaf (e.g. `"TableA"`, `"NONE"`).
+    /// Complements the auto-generated discriminator field
+    /// (`<field>_type`) which exposes the numeric tag instead. Only
+    /// valid in tail position immediately after a union-typed Field;
+    /// the executor rejects it otherwise.
+    UnionType,
     // NB: `Step::UnionMember` from the design doc is intentionally
     // absent here. The parser cannot tell a union-member name from a
     // sub-table field name syntactically (both are dotted
@@ -121,9 +128,9 @@ pub enum ParseErrorKind {
     /// A `[123…]` literal exceeded `usize`.
     IndexTooLarge,
     /// `|` appeared but was not followed by a recognised keyword
-    /// (currently only `keys`).
+    /// (currently `keys` or `type`).
     UnknownPipeKeyword { found: String },
-    /// Unexpected trailing characters after a `|keys` marker.
+    /// Unexpected trailing characters after a `|<keyword>` marker.
     TrailingAfterPipe,
     /// A character that is not part of the grammar appeared mid-path.
     UnexpectedChar { found: char },
@@ -150,7 +157,7 @@ impl fmt::Display for ParseError {
             EmptyBracket => f.write_str("empty '[]' in path"),
             IndexTooLarge => f.write_str("vector index does not fit in usize"),
             UnknownPipeKeyword { found } => write!(f, "unknown '|' keyword: {found:?}"),
-            TrailingAfterPipe => f.write_str("trailing characters after '|keys'"),
+            TrailingAfterPipe => f.write_str("trailing characters after '|<keyword>'"),
             UnexpectedChar { found } => write!(f, "unexpected character {found:?}"),
         }
     }

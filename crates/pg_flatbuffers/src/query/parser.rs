@@ -11,7 +11,7 @@
 //! ```text
 //! query   := [SCHEMA ':'] TABLE ':' path
 //! path    := segment ('.' segment)*
-//! segment := (IDENT | '#' DIGITS) (bracket)* ('|keys')?
+//! segment := (IDENT | '#' DIGITS) (bracket)* ('|keys' | '|type')?
 //! bracket := '[' ('*' | DIGITS | TEXT) ']'
 //! ```
 //!
@@ -33,7 +33,7 @@ pub const DEFAULT_MAX_QUERY_LENGTH: usize = 4096;
 
 /// Default cap matching `docs/design.md` §10
 /// (`pg_flatbuffers.max_path_depth`). One unit of depth = one path
-/// step (field, index, all, map-key, or map-keys).
+/// step (field, index, all, map-key, map-keys, or union-type).
 pub const DEFAULT_MAX_PATH_DEPTH: usize = 256;
 
 /// Parse with the default bounds. Convenience wrapper around
@@ -323,7 +323,7 @@ impl<'a> Parser<'a> {
             self.parse_bracket()?;
         }
 
-        // 3. Optional `|keys`.
+        // 3. Optional `|keys` or `|type` (terminal markers).
         if let Some(b'|') = self.peek() {
             self.parse_pipe()?;
         }
@@ -401,18 +401,24 @@ impl<'a> Parser<'a> {
         }
         let keyword =
             std::str::from_utf8(&self.bytes[kw_start..self.pos]).expect("ASCII alphabetic");
-        if keyword != "keys" {
-            return Err(ParseError {
-                kind: ParseErrorKind::UnknownPipeKeyword {
-                    found: keyword.to_owned(),
-                },
-                position: self.base + pipe_start,
-            });
-        }
-        self.push(Step::MapKeys)?;
+        let step = match keyword {
+            "keys" => Step::MapKeys,
+            "type" => Step::UnionType,
+            other => {
+                return Err(ParseError {
+                    kind: ParseErrorKind::UnknownPipeKeyword {
+                        found: other.to_owned(),
+                    },
+                    position: self.base + pipe_start,
+                });
+            }
+        };
+        self.push(step)?;
 
-        // After |keys, only `.` (next segment) or end-of-input is
-        // legal. A `[` or another `|` here would be nonsense.
+        // After `|<keyword>`, only `.` (next segment) or end-of-input
+        // is legal. A `[` or another `|` here would be nonsense, and
+        // descent past a terminal-leaf marker is rejected by the
+        // executor anyway — catching it here gives a sharper error.
         match self.peek() {
             None | Some(b'.') => Ok(()),
             Some(_) => Err(ParseError {
@@ -728,6 +734,32 @@ mod tests {
     #[test]
     fn rejects_pipe_followed_by_bracket() {
         let e = err("Order:items|keys[0]");
+        assert_eq!(e.kind, ParseErrorKind::TrailingAfterPipe);
+    }
+
+    // --- path: pipe / type ---
+
+    #[test]
+    fn parses_pipe_type() {
+        let q = ok("Msg:body|type");
+        assert_eq!(q.steps, vec![name("body"), Step::UnionType]);
+    }
+
+    #[test]
+    fn parses_pipe_type_after_dotted_path() {
+        // `|type` lives in tail position after any field, regardless
+        // of the preceding chain. The executor rejects it on
+        // non-union targets; the parser is purely structural.
+        let q = ok("Outer:wrapper.body|type");
+        assert_eq!(
+            q.steps,
+            vec![name("wrapper"), name("body"), Step::UnionType]
+        );
+    }
+
+    #[test]
+    fn rejects_pipe_type_followed_by_bracket() {
+        let e = err("Msg:body|type[0]");
         assert_eq!(e.kind, ParseErrorKind::TrailingAfterPipe);
     }
 
