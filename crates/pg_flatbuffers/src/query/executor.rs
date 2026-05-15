@@ -32,6 +32,17 @@
 //!   Supports nested-struct fields and scalar leaves; rejects any
 //!   non-`Field` step (structs hold no vectors, only scalars,
 //!   nested structs, and — deferred — fixed-size arrays).
+//! - Union dispatch (`BaseType::Union`, design §4.3). Reads the
+//!   `u8` discriminator from the vtable slot immediately preceding
+//!   the union value (flatc convention: discriminator at slot N-2,
+//!   value at slot N), looks up the matching `EnumVal` in the
+//!   reflected enum, resolves the underlying variant `Object`, and
+//!   recursively descends with the remaining steps. Discriminator
+//!   value `0` (`NONE`) short-circuits to a single `None` leaf.
+//!   Variant-table-only in v0.1; struct or string variants are
+//!   rejected loudly. The auto-generated discriminator field
+//!   (`<name>_type`, `BaseType::UType`) is queryable as a `u8`
+//!   scalar leaf so callers can introspect the active variant.
 //! - `Step::Index` for vector access (§7.2 step 2). Out-of-range
 //!   indices short-circuit to a single `None` per design §4.3.
 //! - `Step::All` for vector fanout (§7.2 step 3). Emits one entry
@@ -57,12 +68,11 @@
 //!   inline element windows; reuse `walk_struct` once that lands.
 //! - Fixed-size arrays inside structs (`BaseType::Array`) — same
 //!   element-window math as vectors-of-structs; deferred together.
+//! - Union variants other than table (struct or string variants).
 //! - `BaseType::Vector64` — element-offset arithmetic uses 64-bit
 //!   offsets and `flatbuffers::Vector<T>` only handles 32-bit;
 //!   rejected loudly so we don't silently truncate addresses.
 //! - Vectors of unions / vectors of vectors / vectors of arrays.
-//! - Union dispatch — needs the discriminator-slot pairing logic from
-//!   §4.3 ("Union types").
 //! - The `pg_flatbuffers.proto3_defaults` GUC (§10) — today scalar
 //!   "absent" returns the schema default (postgres-protobuf compat).
 //!
@@ -294,6 +304,7 @@ fn walk_table(
                 None => Ok(vec![None]),
             }
         }
+        BaseType::Union => walk_union(table, &field, schema, tail),
         other => Err(ExecuteError::UnsupportedType {
             field: field_name.to_string(),
             type_name: base_type_name(other),
@@ -951,6 +962,156 @@ fn read_struct_scalar_leaf(
     Ok(Some(s))
 }
 
+// ---------------------------------------------------------------------------
+// Union dispatch
+// ---------------------------------------------------------------------------
+
+/// Resolve a `BaseType::Union` field to its active variant and
+/// recursively descend with the remaining steps. The wire layout
+/// (design §4.3, "Union types"):
+///
+/// - The union value sits at vtable slot `N` (== `value_field.offset()`).
+/// - The auto-generated `u8` discriminator (`<name>_type`,
+///   `BaseType::UType`) sits at slot `N - 2` (flatc convention).
+/// - Discriminator `0` is the synthesized `NONE` variant: no value,
+///   short-circuits to `Ok(vec![None])` — same shape as an absent
+///   sub-table.
+///
+/// Variant lookup goes through the reflected `Enum` (sorted by
+/// `value`, so [`flatbuffers::Vector::lookup_by_key`] is O(log N)).
+/// `EnumVal::union_type()` then resolves the underlying `Type`.
+///
+/// v0.1 supports **table-typed variants only**: struct or string
+/// variants are rejected with [`ExecuteError::UnsupportedType`].
+/// Empty `tail` is rejected too — the value table itself has no v0.1
+/// textual leaf form (matches the absent-tail behaviour for nested
+/// tables; descend with `.field` to get a value).
+fn walk_union(
+    table: &Table,
+    value_field: &Field,
+    schema: &Schema,
+    tail: &[Step],
+) -> Result<Vec<Option<String>>, ExecuteError> {
+    let field_name = value_field.name();
+    let value_slot = value_field.offset();
+
+    // Discriminator slot is the immediately preceding vtable slot.
+    // A vtable slot < 2 would mean the union value is the very first
+    // field, leaving no room for the discriminator — flatc would
+    // never emit such a layout, so treat it as a corrupted `.bfbs`.
+    let disc_slot = match value_slot.checked_sub(2) {
+        Some(s) => s,
+        None => {
+            return Err(ExecuteError::Internal(format!(
+                "union value field {field_name:?} has vtable offset {value_slot}; \
+                 expected ≥2 to leave room for the discriminator slot"
+            )));
+        }
+    };
+
+    // SAFETY: see `execute`. The verifier validated that the
+    // discriminator slot, when present, holds a valid `u8` union
+    // tag for `value_field.type_().index()`'s enum.
+    let disc = unsafe { table.get::<u8>(disc_slot, Some(0)) }.unwrap_or(0);
+    if disc == 0 {
+        // `NONE` variant (or discriminator absent altogether) —
+        // there is no value to descend into; one virtual `None`
+        // leaf, matching the absent-sub-table shape.
+        return Ok(vec![None]);
+    }
+
+    // Resolve the enum and the matching variant.
+    let enum_index = value_field.type_().index();
+    if enum_index < 0 {
+        return Err(ExecuteError::Internal(format!(
+            "schema field {field_name:?} has BaseType::Union but negative \
+             enum index ({enum_index})"
+        )));
+    }
+    let enum_idx =
+        usize::try_from(enum_index).expect("non-negative after the explicit < 0 guard above");
+    let enums = schema.enums();
+    if enum_idx >= enums.len() {
+        return Err(ExecuteError::Internal(format!(
+            "schema field {field_name:?} references enum index {enum_idx} \
+             but schema has only {} enums",
+            enums.len()
+        )));
+    }
+    let enum_def = enums.get(enum_idx);
+
+    // EnumVal vector is sorted by `value` (per the upstream
+    // `key_compare_*` impls), so lookup is O(log N).
+    let variant = enum_def
+        .values()
+        .lookup_by_key(disc as i64, |v, k| v.key_compare_with_value(*k))
+        .ok_or_else(|| {
+            ExecuteError::Internal(format!(
+                "union field {field_name:?} discriminator {disc} not found in \
+                 enum {:?}",
+                enum_def.name()
+            ))
+        })?;
+
+    // Resolve the variant's underlying type.
+    let variant_type = variant.union_type().ok_or_else(|| {
+        ExecuteError::Internal(format!(
+            "union variant {:?} has no union_type",
+            variant.name()
+        ))
+    })?;
+    if variant_type.base_type() != BaseType::Obj {
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: "union with non-table variant (v0.1 supports table variants only)",
+        });
+    }
+    let variant_obj_idx = variant_type.index();
+    if variant_obj_idx < 0 {
+        return Err(ExecuteError::Internal(format!(
+            "union variant {:?} has Obj union_type but negative object index ({variant_obj_idx})",
+            variant.name()
+        )));
+    }
+    let variant_object = schema.objects().get(
+        usize::try_from(variant_obj_idx).expect("non-negative after the explicit < 0 guard above"),
+    );
+    if variant_object.is_struct() {
+        // Same as above: struct variants need a separate slice
+        // (would dispatch to `walk_struct` once we settle the
+        // wire-format check — flatc allows struct unions only via
+        // the `(native_inline)` extension, which v0.1 doesn't model).
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: "union with struct variant (v0.1 supports table variants only)",
+        });
+    }
+
+    // Note: `tail` is guaranteed non-empty here. `walk_table`'s
+    // leaf short-circuit fires before the descent match dispatches
+    // to `walk_union`, so the empty-tail case is handled by
+    // `read_leaf` (which rejects `BaseType::Union` loudly).
+
+    // SAFETY: see `execute`. Verifier validated that, when the
+    // discriminator is non-zero, slot N holds a valid
+    // `ForwardsUOffset<Table>` referencing a buffer-bounded table
+    // matching `variant_object`. We bypass `get_field_table` here
+    // because that helper guards on `field.type_().base_type() ==
+    // BaseType::Obj` and would reject a `BaseType::Union` field —
+    // but the wire layout for a union value is identical to a
+    // sub-table (a forward 32-bit offset to a table), so reading
+    // it directly via `Table::get` is sound.
+    let value_table_opt =
+        unsafe { table.get::<ForwardsUOffset<Table>>(value_field.offset(), None) };
+    match value_table_opt {
+        Some(value_table) => walk_table(&value_table, &variant_object, schema, tail),
+        // Defensive: discriminator non-zero but value slot absent.
+        // Verifier would normally have rejected this; treat as `None`
+        // rather than panicking on a misclassified malformed buffer.
+        None => Ok(vec![None]),
+    }
+}
+
 /// Stringify the `idx`-th element of a vector whose elements are
 /// scalars or strings. Returns `Ok(None)` when the index is past the
 /// end or the vector itself is absent.
@@ -1095,6 +1256,7 @@ fn read_leaf(
         BaseType::Bool
         | BaseType::Byte
         | BaseType::UByte
+        | BaseType::UType
         | BaseType::Short
         | BaseType::UShort
         | BaseType::Int
@@ -1119,7 +1281,6 @@ fn read_leaf(
         | BaseType::Vector
         | BaseType::Vector64
         | BaseType::Union
-        | BaseType::UType
         | BaseType::Array
         | BaseType::None => Err(ExecuteError::UnsupportedType {
             field: field_name.to_string(),
@@ -1234,8 +1395,8 @@ mod tests {
     use crate::query::parse;
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers_reflection::reflection::{
-        root_as_schema, Enum, Field as RField, FieldArgs, Object as RObject, ObjectArgs,
-        Schema as RSchema, SchemaArgs, Type, TypeArgs,
+        root_as_schema, Enum, EnumArgs, EnumVal, EnumValArgs, Field as RField, FieldArgs,
+        Object as RObject, ObjectArgs, Schema as RSchema, SchemaArgs, Type, TypeArgs,
     };
 
     // -- fixtures --
@@ -2821,6 +2982,429 @@ mod tests {
         assert!(
             matches!(&err, ExecuteError::UnsupportedType { field, type_name }
                 if field == "x" && *type_name == "float"),
+            "got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Union dispatch fixtures + tests (design §4.3, §7.2).
+    // -----------------------------------------------------------------
+
+    /// Build the reflected schema:
+    ///
+    /// ```fbs
+    /// table A   { name:string;   }   // object index 0
+    /// table B   { count:int;     }   // object index 1
+    /// union U   { A, B }             // enum   index 0
+    /// table Msg { body:U;        }   // object index 2
+    ///                                 //   body_type:UType @ slot 4
+    ///                                 //   body:Union     @ slot 6
+    /// root_type Msg;
+    /// ```
+    ///
+    /// Object vector is sorted alphabetically: `A` (0), `B` (1),
+    /// `Msg` (2). Enum vector has a single entry: `U` (0). Within
+    /// `U`, `EnumVal`s are sorted by `value`: `NONE` (0), `A` (1),
+    /// `B` (2) — that ordering is what lets `walk_union` use
+    /// [`flatbuffers::Vector::lookup_by_key`] for the discriminator.
+    fn build_union_schema() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+
+        // Scalar types.
+        let int_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Int,
+                ..Default::default()
+            },
+        );
+        let str_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::String,
+                ..Default::default()
+            },
+        );
+
+        // table A { name:string; }  -> object index 0
+        let a_name_n = fbb.create_string("name");
+        let a_name = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(a_name_n),
+                type_: Some(str_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let a_fields = fbb.create_vector(&[a_name]);
+        let a_n = fbb.create_string("A");
+        let a = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(a_n),
+                fields: Some(a_fields),
+                ..Default::default()
+            },
+        );
+
+        // table B { count:int; }  -> object index 1
+        let b_count_n = fbb.create_string("count");
+        let b_count = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(b_count_n),
+                type_: Some(int_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let b_fields = fbb.create_vector(&[b_count]);
+        let b_n = fbb.create_string("B");
+        let b = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(b_n),
+                fields: Some(b_fields),
+                ..Default::default()
+            },
+        );
+
+        // enum U { NONE=0, A=1, B=2 } as a union (enum index 0).
+        let none_n = fbb.create_string("NONE");
+        // The NONE variant has a `union_type` of `BaseType::None` —
+        // it never resolves to an object, so we don't need an
+        // `index` here, but we *do* emit it to mirror flatc output.
+        let none_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::None,
+                ..Default::default()
+            },
+        );
+        let none_ev = EnumVal::create(
+            &mut fbb,
+            &EnumValArgs {
+                name: Some(none_n),
+                value: 0,
+                union_type: Some(none_t),
+                ..Default::default()
+            },
+        );
+
+        let a_variant_n = fbb.create_string("A");
+        let a_obj_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Obj,
+                index: 0, // points at object A
+                ..Default::default()
+            },
+        );
+        let a_ev = EnumVal::create(
+            &mut fbb,
+            &EnumValArgs {
+                name: Some(a_variant_n),
+                value: 1,
+                union_type: Some(a_obj_t),
+                ..Default::default()
+            },
+        );
+
+        let b_variant_n = fbb.create_string("B");
+        let b_obj_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Obj,
+                index: 1, // points at object B
+                ..Default::default()
+            },
+        );
+        let b_ev = EnumVal::create(
+            &mut fbb,
+            &EnumValArgs {
+                name: Some(b_variant_n),
+                value: 2,
+                union_type: Some(b_obj_t),
+                ..Default::default()
+            },
+        );
+
+        // EnumVals stored sorted by `value` (already 0/1/2).
+        let u_values = fbb.create_vector(&[none_ev, a_ev, b_ev]);
+        let u_underlying = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::UType,
+                index: 0, // self-reference is harmless here
+                ..Default::default()
+            },
+        );
+        let u_n = fbb.create_string("U");
+        let u_enum = Enum::create(
+            &mut fbb,
+            &EnumArgs {
+                name: Some(u_n),
+                values: Some(u_values),
+                is_union: true,
+                underlying_type: Some(u_underlying),
+                ..Default::default()
+            },
+        );
+
+        // table Msg { body:U; }  -> object index 2
+        // body_type:UType  @ slot 4 (id 0)
+        // body:Union       @ slot 6 (id 1)
+        let body_type_n = fbb.create_string("body_type");
+        let body_utype_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::UType,
+                index: 0, // points at enum U
+                ..Default::default()
+            },
+        );
+        let body_type_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(body_type_n),
+                type_: Some(body_utype_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+
+        let body_n = fbb.create_string("body");
+        let body_union_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Union,
+                index: 0, // points at enum U
+                ..Default::default()
+            },
+        );
+        let body_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(body_n),
+                type_: Some(body_union_t),
+                id: 1,
+                offset: 6,
+                ..Default::default()
+            },
+        );
+
+        // Field vector sorted alphabetically: "body" < "body_type".
+        let msg_fields = fbb.create_vector(&[body_f, body_type_f]);
+        let msg_n = fbb.create_string("Msg");
+        let msg = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(msg_n),
+                fields: Some(msg_fields),
+                ..Default::default()
+            },
+        );
+
+        // Object vector sorted: A, B, Msg.
+        let objects = fbb.create_vector(&[a, b, msg]);
+        let enums = fbb.create_vector(&[u_enum]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(msg),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// Pick which variant (and what payload) to write into a `Msg`
+    /// buffer built by [`build_msg_buf`].
+    enum UnionVariant<'a> {
+        /// Discriminator 0; both `body_type` and `body` slots are
+        /// omitted (matches the wire shape flatc emits for a NONE
+        /// union).
+        None,
+        /// Discriminator 1; pushes a `TableA` into `body` with the
+        /// given `name`.
+        A(&'a str),
+        /// Discriminator 2; pushes a `TableB` into `body` with the
+        /// given `count`.
+        B(i32),
+    }
+
+    /// Build a `Msg` buffer for the schema produced by
+    /// [`build_union_schema`]. Slot 4 holds the `u8` discriminator
+    /// and slot 6 holds the union value (a sub-table offset).
+    fn build_msg_buf(variant: UnionVariant<'_>) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+
+        // Build the value sub-table first so its offset is known.
+        // `flatbuffers::WIPOffset` is generic over the table type;
+        // erase to a `usize`-shaped offset before pushing into the
+        // union slot to keep both arms type-compatible.
+        let (disc, value_off) = match variant {
+            UnionVariant::None => (0u8, None),
+            UnionVariant::A(name) => {
+                let name_off = fbb.create_string(name);
+                let t = fbb.start_table();
+                fbb.push_slot_always(4, name_off);
+                let off = fbb.end_table(t);
+                (1, Some(off))
+            }
+            UnionVariant::B(count) => {
+                let t = fbb.start_table();
+                fbb.push_slot::<i32>(4, count, 0);
+                let off = fbb.end_table(t);
+                (2, Some(off))
+            }
+        };
+
+        let t = fbb.start_table();
+        if disc != 0 {
+            // Discriminator at slot 4 (default 0 = NONE).
+            fbb.push_slot::<u8>(4, disc, 0);
+        }
+        if let Some(off) = value_off {
+            // Union value pointer at slot 6.
+            fbb.push_slot_always(6, off);
+        }
+        let msg = fbb.end_table(t);
+        fbb.finish_minimal(msg);
+        fbb.finished_data().to_vec()
+    }
+
+    /// Test helper: execute against the union schema and return the
+    /// first leaf.
+    fn run_union(query_str: &str, buf: &[u8], bfbs: &[u8]) -> Result<Option<String>, ExecuteError> {
+        let schema = root_as_schema(bfbs).expect("test schema verifies");
+        let query = parse(query_str).expect("test query parses");
+        execute(buf, &schema, &query, &Bounds::default()).map(|v| v.into_iter().next().flatten())
+    }
+
+    /// Test helper: execute against the union schema and return the
+    /// raw error (used by the unsupported-step / not-found tests).
+    fn run_union_err(query_str: &str, buf: &[u8], bfbs: &[u8]) -> ExecuteError {
+        let schema = root_as_schema(bfbs).expect("test schema verifies");
+        let query = parse(query_str).expect("test query parses");
+        execute(buf, &schema, &query, &Bounds::default()).unwrap_err()
+    }
+
+    #[test]
+    fn union_descends_into_table_a_variant() {
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::A("hello"));
+        // Auto-dispatch through the discriminator: body resolves to
+        // TableA, then `.name` reads the string scalar leaf.
+        assert_eq!(
+            run_union("Msg:body.name", &buf, &bfbs).unwrap(),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn union_descends_into_table_b_variant() {
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::B(42));
+        assert_eq!(
+            run_union("Msg:body.count", &buf, &bfbs).unwrap(),
+            Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn union_none_variant_yields_none() {
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::None);
+        // Discriminator 0 short-circuits to `vec![None]` regardless
+        // of what's asked beneath the union; same shape as an
+        // absent sub-table.
+        assert_eq!(run_union("Msg:body.name", &buf, &bfbs).unwrap(), None);
+        assert_eq!(run_union("Msg:body.count", &buf, &bfbs).unwrap(), None);
+    }
+
+    #[test]
+    fn union_field_not_in_active_variant_errors() {
+        let bfbs = build_union_schema();
+        // Active variant is A (which has `name` only); ask for B's
+        // `count`. Auto-dispatch lands in TableA, where `count`
+        // doesn't exist → FieldNotFound.
+        let buf = build_msg_buf(UnionVariant::A("hi"));
+        let err = run_union_err("Msg:body.count", &buf, &bfbs);
+        assert!(
+            matches!(&err, ExecuteError::FieldNotFound { what, table }
+                if what == "count" && table == "A"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn union_at_leaf_errors() {
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::A("x"));
+        // `Msg:body` with no descent — the union value is not a
+        // textual leaf. Hits the existing `read_leaf` rejection
+        // with `type_name: "union"`. Adding the variant-specific
+        // "descend with `.field`" hint would require duplicating
+        // the dispatch here; not worth a slice on its own.
+        let err = run_union_err("Msg:body", &buf, &bfbs);
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedType { field, type_name }
+                if field == "body" && *type_name == "union"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn union_discriminator_field_returns_value() {
+        let bfbs = build_union_schema();
+        // `body_type` is a UType (u8) scalar; queryable directly.
+        // Returns the discriminator number — callers can map it to
+        // a name in SQL until the deferred `|type` syntax lands.
+        assert_eq!(
+            run_union("Msg:body_type", &build_msg_buf(UnionVariant::A("x")), &bfbs).unwrap(),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            run_union("Msg:body_type", &build_msg_buf(UnionVariant::B(0)), &bfbs).unwrap(),
+            Some("2".to_string())
+        );
+        // NONE: discriminator slot omitted → schema default = 0.
+        assert_eq!(
+            run_union("Msg:body_type", &build_msg_buf(UnionVariant::None), &bfbs).unwrap(),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn union_with_index_step_errors() {
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::A("x"));
+        // `[0]` makes no sense on a union (it's not a vector).
+        // Falls through walk_union → walk_table on TableA, which
+        // rejects Step::Index at the `head` match.
+        let err = run_union_err("Msg:body[0]", &buf, &bfbs);
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedStep { what } if *what == "[index]"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn union_with_keys_step_errors() {
+        let bfbs = build_union_schema();
+        let buf = build_msg_buf(UnionVariant::A("x"));
+        // `|keys` on a union: same dispatch path as `[0]`.
+        let err = run_union_err("Msg:body|keys", &buf, &bfbs);
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedStep { what } if *what == "|keys"),
             "got {err:?}"
         );
     }

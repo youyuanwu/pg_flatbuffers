@@ -767,6 +767,242 @@ mod tests {
         fbb.finished_data().to_vec()
     }
 
+    /// Build a tiny union schema for the SQL-side smoke. Same shape
+    /// as the executor's `build_union_schema` fixture (table A with
+    /// `name:string`, table B with `count:int`, union U over both,
+    /// table Msg holding `body:U`). Object ordering: A (0), B (1),
+    /// Msg (2). Enum index for U: 0. Full coverage of dispatch /
+    /// NONE / not-in-variant / step-shape rejection lives in the
+    /// executor module; this fixture only exercises the SQL surface.
+    fn build_msg_schema_bfbs() -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        use flatbuffers_reflection::reflection::{
+            BaseType, Enum, EnumArgs, EnumVal, EnumValArgs, Field as RField, FieldArgs,
+            Object as RObject, ObjectArgs, Schema as RSchema, SchemaArgs, Type, TypeArgs,
+        };
+        let mut fbb = FlatBufferBuilder::new();
+
+        let int_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Int,
+                ..Default::default()
+            },
+        );
+        let str_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::String,
+                ..Default::default()
+            },
+        );
+
+        // table A { name:string @ slot 4; }  -> object index 0
+        let a_name_n = fbb.create_string("name");
+        let a_name = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(a_name_n),
+                type_: Some(str_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let a_fields = fbb.create_vector(&[a_name]);
+        let a_n = fbb.create_string("A");
+        let a = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(a_n),
+                fields: Some(a_fields),
+                ..Default::default()
+            },
+        );
+
+        // table B { count:int @ slot 4; }  -> object index 1
+        let b_count_n = fbb.create_string("count");
+        let b_count = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(b_count_n),
+                type_: Some(int_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let b_fields = fbb.create_vector(&[b_count]);
+        let b_n = fbb.create_string("B");
+        let b = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(b_n),
+                fields: Some(b_fields),
+                ..Default::default()
+            },
+        );
+
+        // enum U { NONE=0, A=1, B=2 } as a union (enum index 0).
+        let none_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::None,
+                ..Default::default()
+            },
+        );
+        let none_n = fbb.create_string("NONE");
+        let none_ev = EnumVal::create(
+            &mut fbb,
+            &EnumValArgs {
+                name: Some(none_n),
+                value: 0,
+                union_type: Some(none_t),
+                ..Default::default()
+            },
+        );
+        let a_obj_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Obj,
+                index: 0,
+                ..Default::default()
+            },
+        );
+        let a_variant_n = fbb.create_string("A");
+        let a_ev = EnumVal::create(
+            &mut fbb,
+            &EnumValArgs {
+                name: Some(a_variant_n),
+                value: 1,
+                union_type: Some(a_obj_t),
+                ..Default::default()
+            },
+        );
+        let b_obj_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Obj,
+                index: 1,
+                ..Default::default()
+            },
+        );
+        let b_variant_n = fbb.create_string("B");
+        let b_ev = EnumVal::create(
+            &mut fbb,
+            &EnumValArgs {
+                name: Some(b_variant_n),
+                value: 2,
+                union_type: Some(b_obj_t),
+                ..Default::default()
+            },
+        );
+        let u_values = fbb.create_vector(&[none_ev, a_ev, b_ev]);
+        let u_underlying = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::UType,
+                index: 0,
+                ..Default::default()
+            },
+        );
+        let u_n = fbb.create_string("U");
+        let u_enum = Enum::create(
+            &mut fbb,
+            &EnumArgs {
+                name: Some(u_n),
+                values: Some(u_values),
+                is_union: true,
+                underlying_type: Some(u_underlying),
+                ..Default::default()
+            },
+        );
+
+        // table Msg { body:U; }  body_type @ slot 4, body @ slot 6.
+        let body_type_n = fbb.create_string("body_type");
+        let body_utype_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::UType,
+                index: 0,
+                ..Default::default()
+            },
+        );
+        let body_type_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(body_type_n),
+                type_: Some(body_utype_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let body_n = fbb.create_string("body");
+        let body_union_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Union,
+                index: 0,
+                ..Default::default()
+            },
+        );
+        let body_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(body_n),
+                type_: Some(body_union_t),
+                id: 1,
+                offset: 6,
+                ..Default::default()
+            },
+        );
+        // Sorted: "body" < "body_type".
+        let msg_fields = fbb.create_vector(&[body_f, body_type_f]);
+        let msg_n = fbb.create_string("Msg");
+        let msg = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(msg_n),
+                fields: Some(msg_fields),
+                ..Default::default()
+            },
+        );
+
+        let objects = fbb.create_vector(&[a, b, msg]);
+        let enums = fbb.create_vector(&[u_enum]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(msg),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// Build a `Msg` buffer carrying a `TableA { name }` variant.
+    /// Discriminator at slot 4 = 1, value sub-table offset at slot 6.
+    fn build_msg_buf_a(name: &str) -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        let mut fbb = FlatBufferBuilder::new();
+        let name_off = fbb.create_string(name);
+        // Build TableA first so its offset is known before Msg opens.
+        let t = fbb.start_table();
+        fbb.push_slot_always(4, name_off);
+        let a_off = fbb.end_table(t);
+        // Msg.
+        let t = fbb.start_table();
+        fbb.push_slot::<u8>(4, 1, 0); // body_type = A
+        fbb.push_slot_always(6, a_off); // body value
+        let m = fbb.end_table(t);
+        fbb.finish_minimal(m);
+        fbb.finished_data().to_vec()
+    }
+
     /// Register `bfbs` as schema `name` rooted at `root_table` via
     /// SPI. Tests run as superuser (pgrx-tests default), so the role
     /// check on `flatbuffers_schemas` is bypassed.
@@ -1043,6 +1279,26 @@ mod tests {
         )
         .expect("SPI failure");
         assert_eq!(v.as_deref(), Some("2.5"));
+    }
+
+    // -- union dispatch (design §7.2 / §4.3) --
+
+    /// SQL-side smoke for `walk_union`: auto-dispatch through the
+    /// `body_type` discriminator and read a string scalar from the
+    /// active variant table. Full coverage of NONE handling,
+    /// not-in-variant FieldNotFound, the discriminator field
+    /// scalar, and step-shape rejection lives in the executor
+    /// module.
+    #[pg_test]
+    fn pg_query_union_dispatch_into_variant() {
+        register("default", "Msg", build_msg_schema_bfbs());
+        let buf = build_msg_buf_a("hello");
+        let v = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Msg:body.name', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure");
+        assert_eq!(v.as_deref(), Some("hello"));
     }
 
     // -- flatbuffers_query_multi --
