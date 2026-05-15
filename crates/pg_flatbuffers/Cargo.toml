@@ -24,6 +24,8 @@ pgrx                   = { workspace = true }
 flatbuffers            = { workspace = true }
 flatbuffers-reflection = { workspace = true }
 thiserror              = { workspace = true }
+parking_lot            = { workspace = true }
+lru                    = { workspace = true }
 
 [dev-dependencies]
 pgrx-tests = { workspace = true }

@@ -48,3 +48,15 @@ REVOKE ALL ON TABLE @extschema@.flatbuffers_schemas FROM PUBLIC;
 GRANT  SELECT ON TABLE @extschema@.flatbuffers_schemas TO PUBLIC;
 GRANT  INSERT, UPDATE, DELETE, TRUNCATE
        ON TABLE @extschema@.flatbuffers_schemas TO flatbuffers_admin;
+
+-- Per-backend cache invalidation. Plain DML on user tables does not
+-- emit relcache invalidation messages, so we install a STATEMENT-level
+-- AFTER trigger that calls CacheInvalidateRelcacheByRelid via Rust.
+-- One firing per statement is enough because the backend only needs
+-- to know the catalog *changed*; specific names are re-fetched on
+-- demand.
+CREATE TRIGGER flatbuffers_schemas_invalidate_cache
+    AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE
+    ON @extschema@.flatbuffers_schemas
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION @extschema@.flatbuffers_schemas_invalidate_trigger();

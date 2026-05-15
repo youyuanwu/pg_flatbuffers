@@ -11,14 +11,30 @@ use pgrx::prelude::*;
 ::pgrx::pg_module_magic!(name, version);
 
 mod catalog;
+mod schema_cache;
 
-// Catalog DDL. Must be emitted *after* `flatbuffers_validate_schema`
-// is created, because the CHECK constraint references it.
+// Catalog DDL. Must be emitted *after* the Rust functions it
+// references in CHECK / trigger bodies are created.
 extension_sql_file!(
     "../sql/catalog.sql",
     name = "catalog",
-    requires = [catalog::flatbuffers_validate_schema],
+    requires = [
+        catalog::flatbuffers_validate_schema,
+        catalog::flatbuffers_schemas_invalidate_trigger,
+    ],
 );
+
+/// Postgres calls this once per backend when it loads the extension's
+/// shared library. We use it to register the schema-cache invalidation
+/// callback so every backend sees catalog updates committed elsewhere.
+///
+/// Must be `#[pg_guard]`'d so that any panic / `ereport(ERROR)` inside
+/// initialization is converted to a Postgres ERROR rather than
+/// unwinding into Postgres' C frames.
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    schema_cache::init();
+}
 
 /// Returns the extension version as a packed integer:
 /// `MAJOR * 10_000 + MINOR * 100 + PATCH`.

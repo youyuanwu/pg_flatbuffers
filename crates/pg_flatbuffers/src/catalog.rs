@@ -37,6 +37,37 @@ fn flatbuffers_validate_schema(bfbs: &[u8]) -> bool {
     }
 }
 
+/// Trigger fired AFTER any INSERT/UPDATE/DELETE/TRUNCATE on
+/// `flatbuffers_schemas`. Emits a relcache invalidation message for
+/// the catalog table, which:
+///
+/// 1. Drops this backend's cached schemas immediately (the local
+///    invalidation queue is processed at the next
+///    `CommandCounterIncrement` / `AcceptInvalidationMessages`).
+/// 2. Is propagated to every other backend via shared sinval on
+///    transaction commit, so they drop their caches at the next
+///    statement boundary.
+///
+/// The trigger is needed because Postgres does **not** automatically
+/// emit `CacheInvalidateRelcache` on plain DML against user tables
+/// (only on DDL, and on row changes to system catalogs).
+#[pg_trigger]
+fn flatbuffers_schemas_invalidate_trigger<'a>(
+    trigger: &'a PgTrigger<'a>,
+) -> Result<Option<PgHeapTuple<'a, impl WhoAllocated>>, PgTriggerError> {
+    let relid = trigger.relid()?;
+    // SAFETY: stable Postgres C API; safe to call from any backend
+    // context. Adds a message to the local invalidation queue, which
+    // PG processes at the next safe boundary.
+    unsafe { ::pgrx::pg_sys::CacheInvalidateRelcacheByRelid(relid) };
+
+    // Pass-through: returning the row that was being modified is the
+    // standard behaviour for STATEMENT-level AFTER triggers (the value
+    // is ignored by the executor but the function signature requires
+    // a tuple). For TRUNCATE there is no OLD/NEW, so return None.
+    Ok(trigger.old().or_else(|| trigger.new()))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
