@@ -792,6 +792,55 @@ mod tests {
         assert!(v.is_none(), "got {v:?}");
     }
 
+    /// `field|keys` enumerates the `(key)`-annotated field of every
+    /// entry in wire order. Surfaces as a `text[]` via
+    /// `flatbuffers_query_array`; full unit coverage (duplicates,
+    /// empty / absent vectors, scalar-vector rejection) lives in
+    /// the executor module.
+    #[pg_test]
+    fn pg_query_map_keys_array_returns_keys_in_wire_order() {
+        register("default", "Catalog", build_catalog_schema_bfbs());
+        let buf = build_catalog_buf(&["alpha", "beta", "gamma"]);
+        let v = Spi::get_one_with_args::<Vec<Option<String>>>(
+            "SELECT flatbuffers_query_array('Catalog:entries|keys', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure")
+        .expect("non-NULL result");
+        assert_eq!(
+            v,
+            vec![
+                Some("alpha".to_owned()),
+                Some("beta".to_owned()),
+                Some("gamma".to_owned()),
+            ],
+        );
+    }
+
+    /// Same query through `flatbuffers_query_multi` (SETOF text)
+    /// yields one row per key in the same wire-format order.
+    #[pg_test]
+    fn pg_query_map_keys_multi_yields_one_row_per_key() {
+        register("default", "Catalog", build_catalog_schema_bfbs());
+        let buf = build_catalog_buf(&["alpha", "beta", "gamma"]);
+        let v = Spi::get_one_with_args::<Vec<Option<String>>>(
+            "SELECT array_agg(t ORDER BY ord) \
+             FROM flatbuffers_query_multi('Catalog:entries|keys', $1) \
+                 WITH ORDINALITY AS s(t, ord)",
+            &[buf.into()],
+        )
+        .expect("SPI failure")
+        .expect("non-NULL result");
+        assert_eq!(
+            v,
+            vec![
+                Some("alpha".to_owned()),
+                Some("beta".to_owned()),
+                Some("gamma".to_owned()),
+            ],
+        );
+    }
+
     // -- flatbuffers_query_multi --
 
     /// `STRICT` short-circuits NULL inputs \u2014 zero rows, never the

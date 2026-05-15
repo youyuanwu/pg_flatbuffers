@@ -33,14 +33,21 @@
 //!   per vector element in wire-format order. Supported element
 //!   types: scalars, bool, string, and tables (descend with the
 //!   remaining steps; nested `[*]` accumulates depth-first).
+//! - `Step::MapKey` for `(key)`-vector lookup (§7.2 step 4). Linear
+//!   scan (the §10 `pg_flatbuffers.key_lookup_strict = off`
+//!   fallback) until the verifier sortedness check lands and lets
+//!   the strict path switch to binary search. String- and
+//!   integer-keyed `Entry` tables supported.
+//! - `Step::MapKeys` for fanning out the `(key)` field of every
+//!   element of a `(key)`-annotated vector (§7.2 step 5). Like
+//!   `[*]` but constrained to the keyed field; tail must be empty
+//!   because the keys themselves are the leaves.
 //! - Stringification of scalar (int/uint/float/bool) and string leaves
 //!   via [`flatbuffers_reflection::get_any_field_string`].
 //!
 //! Deliberately deferred to dedicated micro-slices, each returning a
 //! clear [`ExecuteError::Unsupported*`] variant today:
 //!
-//! - `Step::MapKey`, `Step::MapKeys` — `(key)`-vector lookups
-//!   (§7.2 step 4/5).
 //! - Struct descent (bare and as vector elements) — needs a separate
 //!   `walk_struct` cursor since structs are inline fixed-size and
 //!   use different accessors than tables.
@@ -338,7 +345,7 @@ fn walk_vector(
         Step::MapKey(key) => {
             walk_vector_at_map_key(table, field, schema, key, tail, element_base_type)
         }
-        Step::MapKeys => Err(ExecuteError::UnsupportedStep { what: "|keys" }),
+        Step::MapKeys => walk_vector_map_keys(table, field, schema, tail, element_base_type),
         // A `Step::Field` after a vector field is a parser bug — the
         // grammar requires an indexer right after the vector. Be
         // defensive in case the AST grows new arms.
@@ -676,6 +683,74 @@ fn walk_vector_at_map_key(
     }
     // No element matched — short-circuit, same as out-of-range index.
     Ok(vec![None])
+}
+
+/// `field|keys` — fan out the `(key)`-annotated field of every
+/// element of a vector of tables, in wire-format order. The keys
+/// **are** the leaves: `tail` must be empty, since there is nothing
+/// to descend into past a stringified key.
+///
+/// Symmetric to [`walk_vector_all`] but constrained to the keyed
+/// field rather than recursing with arbitrary `tail`. Absent /
+/// empty vector → `vec![]` (no items to fan out, matching the
+/// `[*]` semantics).
+fn walk_vector_map_keys(
+    table: &Table,
+    field: &Field,
+    schema: &Schema,
+    tail: &[Step],
+    element_base_type: BaseType,
+) -> Result<Vec<Option<String>>, ExecuteError> {
+    let field_name = field.name();
+
+    if element_base_type != BaseType::Obj {
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: base_type_name(element_base_type),
+        });
+    }
+
+    let child_object = lookup_vector_element_object(field, schema)?;
+    if child_object.is_struct() {
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: "vector of struct",
+        });
+    }
+
+    let keyed_field = lookup_keyed_field(&child_object)?;
+
+    if !tail.is_empty() {
+        // The parser allows `items|keys.foo` (see `parser.rs`); the
+        // executor rejects it here because `|keys` already produced
+        // a leaf — there's nothing to descend into.
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: "trailing path step after `|keys` (keys are terminal leaves)",
+        });
+    }
+
+    // SAFETY: see `execute`. Same `Vector<ForwardsUOffset<Table>>`
+    // shape as `walk_vector_at_map_key`.
+    let vec_opt = unsafe {
+        table.get::<ForwardsUOffset<Vector<ForwardsUOffset<Table>>>>(field.offset(), None)
+    };
+    let vec = match vec_opt {
+        Some(v) => v,
+        None => return Ok(vec![]),
+    };
+
+    // Pre-size to vec.len(); each element contributes exactly one
+    // key entry (the keyed field is `(key)` and conventionally
+    // required, so it's always present).
+    let mut out: Vec<Option<String>> = Vec::with_capacity(vec.len());
+    for elem in vec.iter() {
+        // SAFETY: see `key_matches`. The keyed field came from the
+        // schema's reflected `Object.fields()`.
+        let key = unsafe { get_any_field_string(&elem, &keyed_field, schema) };
+        out.push(Some(key));
+    }
+    Ok(out)
 }
 
 /// Stringify the `idx`-th element of a vector whose elements are
@@ -1888,6 +1963,83 @@ mod tests {
         // textual form — same rationale as `Bag:items[0]`.
         let buf = build_bag(Some(&["abc"]), None, None, None);
         let err = run_vec("Bag:items[abc]", &buf, &bfbs).unwrap_err();
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedType { field, .. } if field == "items"),
+            "got {err:?}"
+        );
+    }
+
+    // -- Step::MapKeys --
+
+    #[test]
+    fn vector_map_keys_fans_out_keys_in_wire_order() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["a", "b", "c"]), None, None, None);
+        let v = run_vec_all("Bag:items|keys", &buf, &bfbs).expect("ok");
+        assert_eq!(
+            v,
+            vec![
+                Some("a".to_owned()),
+                Some("b".to_owned()),
+                Some("c".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn vector_map_keys_preserves_duplicates() {
+        let bfbs = build_vec_schema();
+        // Linear / wire-order fanout: duplicates are NOT collapsed
+        // (the §10 `key_lookup_strict = off` fallback semantics that
+        // this slice ships unconditionally).
+        let buf = build_bag(Some(&["dup", "x", "dup"]), None, None, None);
+        let v = run_vec_all("Bag:items|keys", &buf, &bfbs).expect("ok");
+        assert_eq!(
+            v,
+            vec![
+                Some("dup".to_owned()),
+                Some("x".to_owned()),
+                Some("dup".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn vector_map_keys_empty_vector_returns_empty_vec() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&[]), None, None, None);
+        let v = run_vec_all("Bag:items|keys", &buf, &bfbs).expect("ok");
+        assert!(v.is_empty(), "got {v:?}");
+    }
+
+    #[test]
+    fn vector_map_keys_absent_vector_returns_empty_vec() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(None, None, None, None);
+        let v = run_vec_all("Bag:items|keys", &buf, &bfbs).expect("ok");
+        assert!(v.is_empty(), "got {v:?}");
+    }
+
+    #[test]
+    fn vector_map_keys_against_scalar_vector_errors() {
+        let bfbs = build_vec_schema();
+        // `tags` is a vector of strings; `|keys` only works over
+        // vectors of `(key)`-annotated tables.
+        let buf = build_bag(None, Some(&["a", "b"]), None, None);
+        let err = run_vec_all("Bag:tags|keys", &buf, &bfbs).unwrap_err();
+        assert!(
+            matches!(&err, ExecuteError::UnsupportedType { field, .. } if field == "tags"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vector_map_keys_with_trailing_step_errors() {
+        let bfbs = build_vec_schema();
+        // Parser allows `items|keys.foo`; executor rejects because
+        // the keys are themselves the leaves.
+        let buf = build_bag(Some(&["a"]), None, None, None);
+        let err = run_vec_all("Bag:items|keys.foo", &buf, &bfbs).unwrap_err();
         assert!(
             matches!(&err, ExecuteError::UnsupportedType { field, .. } if field == "items"),
             "got {err:?}"
