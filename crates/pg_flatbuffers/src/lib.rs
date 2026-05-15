@@ -11,6 +11,7 @@ use pgrx::prelude::*;
 ::pgrx::pg_module_magic!(name, version);
 
 mod catalog;
+mod query;
 mod schema_cache;
 
 // Catalog DDL. Must be emitted *after* the Rust functions it
