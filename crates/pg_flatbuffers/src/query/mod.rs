@@ -8,7 +8,9 @@
 //! See `docs/design.md` §4.3 (language) and §7.1 (parse).
 
 pub mod ast;
+pub mod executor;
 pub mod parser;
 
 pub use ast::{FieldRef, MapKey, ParseError, ParseErrorKind, Query, Step};
+pub use executor::{execute, ExecuteError};
 pub use parser::{parse, parse_with_bounds, DEFAULT_MAX_PATH_DEPTH, DEFAULT_MAX_QUERY_LENGTH};
