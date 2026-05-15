@@ -1,0 +1,6 @@
+comment          = 'pg_flatbuffers: query and convert FlatBuffers payloads in bytea columns'
+default_version  = '@CARGO_VERSION@'
+module_pathname  = '$libdir/pg_flatbuffers'
+relocatable      = false
+superuser        = false
+trusted          = false

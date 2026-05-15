@@ -1,0 +1,39 @@
+# Workspace root for pg_flatbuffers.
+#
+# Member crates live in crates/. Shared dependency versions are hoisted
+# into [workspace.dependencies] so member manifests can `workspace = true`.
+# See docs/design.md §5 for the layout rationale.
+
+[workspace]
+members  = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version      = "0.0.1"
+edition      = "2021"
+rust-version = "1.95"
+license      = "MIT"
+repository   = "https://github.com/example/pg_flatbuffers"
+authors      = ["pg_flatbuffers contributors"]
+
+[workspace.dependencies]
+# pgrx requires exact-version pinning; bump in lockstep across the workspace.
+pgrx       = { version = "=0.18.0" }
+pgrx-tests = { version = "=0.18.0" }
+
+# These will become real dependencies once the executor lands; declared
+# here so the version is owned by the workspace from day one.
+flatbuffers            = "25"
+flatbuffers-reflection = "25"
+serde_json             = "1"
+thiserror              = "2"
+
+[profile.dev]
+# pgrx requires unwinding panics so PG can map them to ereport(ERROR).
+panic = "unwind"
+
+[profile.release]
+panic        = "unwind"
+opt-level    = 3
+lto          = "fat"
+codegen-units = 1

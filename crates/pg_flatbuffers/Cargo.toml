@@ -1,0 +1,26 @@
+[package]
+name         = "pg_flatbuffers"
+description  = "Query and convert FlatBuffers payloads stored in bytea columns"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lib]
+crate-type = ["cdylib"]
+
+# v0.1 ships PG 18 only (see docs/design.md §11). PG 17 is a v0.2 target.
+# Older majors (pg13–pg16) are intentionally absent from the feature set.
+[features]
+default  = ["pg18"]
+pg17     = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18     = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test  = []
+
+[dependencies]
+pgrx = { workspace = true }
+
+[dev-dependencies]
+pgrx-tests = { workspace = true }
