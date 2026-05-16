@@ -22,15 +22,15 @@
 //! Common imports and helpers are re-exported by this `mod.rs` so each
 //! area file can `use super::*;` and pull in the full preamble.
 
-pub(super) use super::map_key::{compare_actual_to_compiled, CompiledKey};
-pub(super) use super::{execute_with_options, ExecuteError, ExecuteOptions};
+pub(super) use super::map_key::{CompiledKey, compare_actual_to_compiled};
+pub(super) use super::{ExecuteError, ExecuteOptions, execute_with_options};
 pub(super) use crate::query::ast::{MapKey, Query, Step};
 pub(super) use crate::query::parse;
 pub(super) use crate::verify::Bounds;
 pub(super) use flatbuffers::FlatBufferBuilder;
 pub(super) use flatbuffers_reflection::reflection::{
-    root_as_schema, BaseType, Enum, EnumArgs, EnumVal, EnumValArgs, Field as RField, FieldArgs,
-    Object as RObject, ObjectArgs, Schema as RSchema, SchemaArgs, Type, TypeArgs,
+    BaseType, Enum, EnumArgs, EnumVal, EnumValArgs, Field as RField, FieldArgs, Object as RObject,
+    ObjectArgs, Schema as RSchema, SchemaArgs, Type, TypeArgs, root_as_schema,
 };
 pub(super) use std::cmp::Ordering;
 

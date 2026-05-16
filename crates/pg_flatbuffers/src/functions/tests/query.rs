@@ -176,6 +176,63 @@ mod tests {
         assert_eq!(v.as_deref(), Some("2.5"));
     }
 
+    /// Floats are stringified through Postgres's `float4out` /
+    /// `float8out` (design §7.2; see `executor::pg_text`), not
+    /// Rust's `Display`. The two formatters diverge on `Infinity`
+    /// / `NaN` (PG: `Infinity`/`-Infinity`/`NaN`, Rust: `inf`/
+    /// `-inf`/`NaN`) and on very large magnitudes (PG switches to
+    /// scientific notation, Rust never does). This test pins down
+    /// the Postgres-formatted output via SPI to confirm the FFI
+    /// path is wired up and matches `SELECT col::text` from a
+    /// `real` column byte-for-byte.
+    #[pg_test]
+    fn pg_query_float_formatting_matches_postgres() {
+        register("default", "Point", build_point_schema_bfbs());
+
+        // Infinity → Postgres prints "Infinity"; Rust would print "inf".
+        let buf = build_point_buf(
+            "p",
+            TestVec3 {
+                x: f32::INFINITY,
+                y: f32::NEG_INFINITY,
+                z: 1.0e20,
+            },
+        );
+        let x = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Point:pos.x', $1)",
+            &[buf.clone().into()],
+        )
+        .expect("SPI failure");
+        assert_eq!(x.as_deref(), Some("Infinity"));
+
+        let y = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Point:pos.y', $1)",
+            &[buf.clone().into()],
+        )
+        .expect("SPI failure");
+        assert_eq!(y.as_deref(), Some("-Infinity"));
+
+        // 1e20 → Postgres prints "1e+20" (scientific); Rust would
+        // print "100000000000000000000".
+        let z = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Point:pos.z', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure");
+        let z = z.as_deref().expect("z should not be NULL");
+        // Sanity-check against `SELECT 1.0e20::real::text` so the
+        // test pins down whatever the running Postgres considers
+        // the canonical shortest decimal for this value (depends on
+        // the session `extra_float_digits` GUC).
+        let expected = Spi::get_one::<String>("SELECT 1.0e20::real::text")
+            .expect("SPI failure")
+            .expect("non-NULL");
+        assert_eq!(
+            z, expected,
+            "executor float formatting diverged from Postgres float4out output"
+        );
+    }
+
     // -- union dispatch (design §7.2 / §4.3) --
 
     /// SQL-side smoke for `walk_union`: auto-dispatch through the

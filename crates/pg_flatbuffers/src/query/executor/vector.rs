@@ -4,12 +4,13 @@
 //! `Step::MapKey` and `Step::MapKeys` live in [`super::map_key`].
 
 use super::map_key::{walk_vector_at_map_key, walk_vector_map_keys};
+use super::pg_text::{format_float4, format_float8};
 use super::struct_::{struct_bytesize, walk_struct};
 use super::util::{base_type_name, map_reflection_err};
 use super::walk::walk_table;
 use super::{ExecuteError, ExecuteOptions};
 use crate::query::ast::Step;
-use flatbuffers::{read_scalar_at, ForwardsUOffset, Table, Vector, SIZE_UOFFSET};
+use flatbuffers::{ForwardsUOffset, SIZE_UOFFSET, Table, Vector, read_scalar_at};
 use flatbuffers_reflection::get_field_vector;
 use flatbuffers_reflection::reflection::{BaseType, Field, Object, Schema};
 
@@ -335,6 +336,24 @@ fn read_vector_element(
             Ok(Some(vec.get(idx).to_string()))
         }};
     }
+    // Float / double elements get the same vector-fetch + bounds
+    // dance but route through Postgres's `float4out` / `float8out`
+    // (see `pg_text` and design §7.2) instead of Rust's `Display`.
+    macro_rules! float {
+        ($t:ty, $fmt:expr) => {{
+            // SAFETY: same as the `scalar!` macro above.
+            let vec_opt =
+                unsafe { get_field_vector::<$t>(table, field) }.map_err(map_reflection_err)?;
+            let vec = match vec_opt {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            if idx >= vec.len() {
+                return Ok(None);
+            }
+            Ok(Some($fmt(vec.get(idx))))
+        }};
+    }
 
     match element_base_type {
         // Bool is wire-encoded as `u8`; stringify as `0`/`1` to
@@ -348,8 +367,8 @@ fn read_vector_element(
         BaseType::UInt => scalar!(u32),
         BaseType::Long => scalar!(i64),
         BaseType::ULong => scalar!(u64),
-        BaseType::Float => scalar!(f32),
-        BaseType::Double => scalar!(f64),
+        BaseType::Float => float!(f32, format_float4),
+        BaseType::Double => float!(f64, format_float8),
         BaseType::String => {
             // SAFETY: see `execute`. The schema asserts the element
             // type is `String`, so the vector slot is a
@@ -399,6 +418,19 @@ fn read_vector_all(
             Ok(vec.iter().map(|e| Some(e.to_string())).collect())
         }};
     }
+    // See `read_vector_element` for the float-formatting rationale.
+    macro_rules! float {
+        ($t:ty, $fmt:expr) => {{
+            // SAFETY: see `read_vector_element`.
+            let vec_opt =
+                unsafe { get_field_vector::<$t>(table, field) }.map_err(map_reflection_err)?;
+            let vec = match vec_opt {
+                Some(v) => v,
+                None => return Ok(vec![]),
+            };
+            Ok(vec.iter().map(|e| Some($fmt(e))).collect())
+        }};
+    }
 
     match element_base_type {
         BaseType::Bool | BaseType::UByte => scalar!(u8),
@@ -409,8 +441,8 @@ fn read_vector_all(
         BaseType::UInt => scalar!(u32),
         BaseType::Long => scalar!(i64),
         BaseType::ULong => scalar!(u64),
-        BaseType::Float => scalar!(f32),
-        BaseType::Double => scalar!(f64),
+        BaseType::Float => float!(f32, format_float4),
+        BaseType::Double => float!(f64, format_float8),
         BaseType::String => {
             // SAFETY: see `read_vector_element` — same direct
             // `table.get::<ForwardsUOffset<Vector<ForwardsUOffset<&str>>>>`

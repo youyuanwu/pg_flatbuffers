@@ -26,9 +26,9 @@ pub use ast::{FieldRef, MapKey, ParseError, ParseErrorKind, Query, Step};
     unused_imports,
     reason = "public-API surface; no in-crate consumer routes through `query::*` yet"
 )]
-pub use executor::{execute_with_options, ExecuteError, ExecuteOptions};
+pub use executor::{ExecuteError, ExecuteOptions, execute_with_options};
 #[allow(
     unused_imports,
     reason = "public-API surface; bound/length constants will be wired through the deferred GUC plumbing slice (§10)"
 )]
-pub use parser::{parse, parse_with_bounds, DEFAULT_MAX_PATH_DEPTH, DEFAULT_MAX_QUERY_LENGTH};
+pub use parser::{DEFAULT_MAX_PATH_DEPTH, DEFAULT_MAX_QUERY_LENGTH, parse, parse_with_bounds};

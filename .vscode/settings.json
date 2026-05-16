@@ -2,6 +2,8 @@
   "chat.tools.terminal.autoApprove": {
     "just": true,
     "cargo test": true,
-    "cargo build": true
+    "cargo build": true,
+    "cargo fmt": true,
+    "cargo clippy": true
   }
 }

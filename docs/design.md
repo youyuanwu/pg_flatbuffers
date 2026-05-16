@@ -239,9 +239,13 @@ Differences vs. protobuf:
     present (including present-equals-default) → the value.
   - Plain scalar with declared default `D` and no `(force_defaults)`
     — omitted from the wire when value equals `D`. Reading an omitted
-    slot returns `D`, not `NULL`. (This differs from postgres-protobuf's
-    proto3 behavior; the GUC `pg_flatbuffers.proto3_defaults = on`
-    restores `NULL`-on-default semantics for users porting workloads.)
+    slot returns `D`, not `NULL` — matching the upstream FlatBuffers
+    reader API. (This differs from postgres-protobuf's proto3 behavior;
+    the `USERSET` GUC `pg_flatbuffers.fill_scalar_defaults = off`
+    surfaces absent scalars as SQL `NULL` instead, recovering
+    presence-aware semantics for users porting workloads or who need
+    to distinguish "writer set field to 0" from "writer never set
+    field". Default `on` preserves the FlatBuffers reader-API shape.)
   - Buffer built with `(force_defaults)` — default-valued slots are on
     the wire and read as their stored value, indistinguishable from
     explicitly-set defaults. The executor never value-compares against
@@ -619,17 +623,20 @@ diagnostics.
 | `pg_flatbuffers.max_build_depth` | 32 | `SUSET` | `from_json` JSON-nesting bound; symmetric to `max_depth`. |
 | `pg_flatbuffers.max_query_length` | 4096 | `SUSET` | Path-parser input bound. |
 | `pg_flatbuffers.max_path_depth` | 256 | `SUSET` | Path-parser depth bound. |
-| `pg_flatbuffers.key_lookup_strict` | `on` | `SUSET` | Reject unsorted/duplicate `(key)` vectors at verifier time; `off` falls back to linear scan with first-match semantics. |
 | `pg_flatbuffers.schema_cache_mb` | 16 | `SIGHUP` | Per-backend LRU size; takes effect on reload, applies to new backends. |
 | `pg_flatbuffers.strict` | `on` | `USERSET` | Per-session: verifier failure → `ERROR` (default) vs. `NULL`. Affects only the calling session's results. |
+| `pg_flatbuffers.key_lookup_strict` | `on` | `USERSET` | Per-session: `on` (default) bisects `(key)`-annotated vectors under the FlatBuffers key-sorted contract (matches the upstream `LookupByKey` accessor); `off` falls back to a linear scan that is correct on any vector but O(n). Read-side only — neither weakens the verifier nor relaxes any DoS bound; the on-mode worst case against a writer that violated the contract is a silent miss, never a buffer over-read. |
 | `pg_flatbuffers.identifier_mismatch` | `warning` | `USERSET` | Per-session diagnostic verbosity for `file_identifier` mismatches; values `error \| warning \| silent`. |
 | `pg_flatbuffers.from_json_unknown` | `error` | `USERSET` | `from_json` policy for unknown JSON keys; values `error \| ignore`. |
-| `pg_flatbuffers.proto3_defaults` | `off` | `USERSET` | When `on`, scalar fields whose stored value equals the schema default return `NULL` (postgres-protobuf compat). Default `off` returns the value (see §4.3 "Defaults and absence"). |
+| `pg_flatbuffers.fill_scalar_defaults` | `on` | `USERSET` | When `on` (default), an absent scalar table field reads back as its schema default (matches the FlatBuffers reader API). When `off`, it surfaces as SQL `NULL` instead, so callers can distinguish "writer set field to 0" from "writer never set field" (postgres-protobuf-style presence). See §4.3 "Defaults and absence". |
 
 All `SUSET` GUCs require superuser to change, so an unprivileged caller
-cannot lift a bound. The two `USERSET` GUCs control opt-in lenient
-semantics (`strict = off`) and per-session diagnostic level only — they
-cannot weaken the verifier or the parser.
+cannot lift a bound. The `USERSET` GUCs (`strict`, `key_lookup_strict`,
+`fill_scalar_defaults`, `identifier_mismatch`, `from_json_unknown`)
+control opt-in lenient semantics, read-side interpretation choices, and
+per-session diagnostic level only — they cannot weaken the verifier or
+the parser, and the on-mode of `key_lookup_strict` against a
+contract-violating writer is a silent miss, not a buffer over-read.
 
 A regression test in §13 asserts that a non-superuser `SET` of any
 `SUSET` GUC fails with `ERROR: permission denied`.

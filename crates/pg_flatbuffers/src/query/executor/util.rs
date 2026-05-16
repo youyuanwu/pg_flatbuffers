@@ -2,9 +2,10 @@
 //! scalar-default stringification, and `BaseType` → name conversion.
 
 use super::ExecuteError;
+use super::pg_text::{format_float4, format_float8};
 use crate::query::ast::FieldRef;
-use flatbuffers_reflection::reflection::{BaseType, Field, Object};
 use flatbuffers_reflection::FlatbufferError;
+use flatbuffers_reflection::reflection::{BaseType, Field, Object};
 
 pub(super) fn find_field<'a>(
     object: &'a Object<'a>,
@@ -52,13 +53,26 @@ pub(super) fn map_reflection_err(e: FlatbufferError) -> ExecuteError {
 /// Stringify a scalar field's schema default, matching the
 /// formatter used by `flatbuffers_reflection::get_any_field_string`
 /// for *present* values: `i64::Display` for integral/bool and
-/// `f64::Display` for floats. We deliberately do not special-case
+/// Postgres's `float4out` / `float8out` for floats (design §7.2;
+/// see [`super::pg_text`]). We deliberately do not special-case
 /// bool to `"true"` / `"false"` because the upstream stringifier
 /// emits `"0"` / `"1"` for present bools and we want absent
 /// bools to round-trip identically.
 pub(super) fn scalar_default_string(field: &Field, base_type: BaseType) -> String {
     match base_type {
-        BaseType::Float | BaseType::Double => field.default_real().to_string(),
+        BaseType::Float => {
+            // Reflection stores all numeric defaults as `f64`; the
+            // schema guarantees the value is representable as `f32`
+            // for a `Float` field, so the narrowing cast is
+            // round-trip safe.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "schema default for a Float field is representable as f32 by construction"
+            )]
+            let v = field.default_real() as f32;
+            format_float4(v)
+        }
+        BaseType::Double => format_float8(field.default_real()),
         // Integral types and bool: `default_integer()` is i64.
         _ => field.default_integer().to_string(),
     }

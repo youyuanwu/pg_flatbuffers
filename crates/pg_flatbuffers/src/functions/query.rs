@@ -4,8 +4,8 @@
 //! point; this file just contains the SQL-level wrapper that returns
 //! the *first* present leaf as `text`.
 
-use super::util::{current_execute_options, resolve_execute_error};
 use super::DEFAULT_SCHEMA;
+use super::util::{current_execute_options, resolve_execute_error};
 use crate::guc::{current_bounds, current_strict};
 use crate::query::{execute_with_options, parse};
 use crate::schema_cache::lookup_schema;

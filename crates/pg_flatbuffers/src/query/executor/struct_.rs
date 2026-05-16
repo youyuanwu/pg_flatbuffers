@@ -2,9 +2,10 @@
 //! (and recursive nested structs), plus `walk_array` for fixed-size
 //! arrays inside structs (`BaseType::Array`).
 
+use super::ExecuteError;
+use super::pg_text::{format_float4, format_float8};
 use super::util::base_type_name;
 use super::util::find_field;
-use super::ExecuteError;
 use crate::query::ast::Step;
 use flatbuffers::read_scalar_at;
 use flatbuffers_reflection::reflection::{BaseType, Field, Object, Schema};
@@ -167,9 +168,10 @@ pub(super) fn walk_struct(
 /// Read and stringify a single scalar at `loc` inside `buf`,
 /// dispatching on `base_type`. Mirrors the scalar-arm formatting
 /// used by [`read_leaf`] / [`read_vector_element`] (integers via
-/// `Display`, floats via `Display`, bool rendered as `0`/`1`) so a
-/// value rendered out of a struct field matches the same value
-/// rendered out of a table or vector element.
+/// `Display`, floats via Postgres's `float4out` / `float8out`, bool
+/// rendered as `0`/`1`) so a value rendered out of a struct field
+/// matches the same value rendered out of a table or vector
+/// element.
 fn read_struct_scalar_leaf(
     buf: &[u8],
     loc: usize,
@@ -201,8 +203,18 @@ fn read_struct_scalar_leaf(
         BaseType::UInt => read!(u32),
         BaseType::Long => read!(i64),
         BaseType::ULong => read!(u64),
-        BaseType::Float => read!(f32),
-        BaseType::Double => read!(f64),
+        // Floats go through Postgres's own `float4out` / `float8out`
+        // — see `pg_text` module-docs and design §7.2.
+        BaseType::Float => {
+            // SAFETY: same as the `read!` macro above.
+            let v: f32 = unsafe { read_scalar_at::<f32>(buf, loc) };
+            format_float4(v)
+        }
+        BaseType::Double => {
+            // SAFETY: same as the `read!` macro above.
+            let v: f64 = unsafe { read_scalar_at::<f64>(buf, loc) };
+            format_float8(v)
+        }
         // Structs cannot legally contain strings, vectors,
         // sub-tables, or unions per the FlatBuffers schema rules
         // (flatc rejects them at compile time). Surface a
@@ -335,8 +347,7 @@ fn walk_array(
         }
         Step::MapKey(_) => Err(ExecuteError::UnsupportedType {
             field: field_name.to_string(),
-            type_name:
-                "[map-key] on fixed-size array (arrays have no (key) annotation; use [i] or [*])",
+            type_name: "[map-key] on fixed-size array (arrays have no (key) annotation; use [i] or [*])",
         }),
         Step::MapKeys => Err(ExecuteError::UnsupportedType {
             field: field_name.to_string(),

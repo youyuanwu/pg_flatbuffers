@@ -1,4 +1,0 @@
-[target.'cfg(target_os="macos")']
-# Postgres symbols are not available until runtime on macOS; tell the
-# linker to defer resolution rather than error out at link time.
-rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]

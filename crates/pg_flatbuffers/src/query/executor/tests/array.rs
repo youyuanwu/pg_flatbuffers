@@ -197,10 +197,13 @@ struct TestBundle {
 impl flatbuffers::Push for TestBundle {
     type Output = TestBundle;
     unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
-        let src = std::slice::from_raw_parts(
-            self as *const Self as *const u8,
-            std::mem::size_of::<Self>(),
-        );
+        // SAFETY: see [`TestVec3`].
+        let src = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        };
         dst[..src.len()].copy_from_slice(src);
     }
 }

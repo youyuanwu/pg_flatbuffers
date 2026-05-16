@@ -294,8 +294,8 @@ mod tests {
     use super::*;
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers_reflection::reflection::{
-        root_as_schema, BaseType, Field, FieldArgs, Object, ObjectArgs, Schema as RSchema,
-        SchemaArgs, Type, TypeArgs,
+        BaseType, Field, FieldArgs, Object, ObjectArgs, Schema as RSchema, SchemaArgs, Type,
+        TypeArgs, root_as_schema,
     };
 
     /// Build a minimal but verifier-clean reflection `Schema` with no

@@ -94,7 +94,7 @@
 
 use super::ast::Query;
 use crate::verify::VerifyError;
-use crate::verify::{verify, Bounds};
+use crate::verify::{Bounds, verify};
 use flatbuffers_reflection::get_any_root;
 use flatbuffers_reflection::reflection::Schema;
 use thiserror::Error;
@@ -228,6 +228,7 @@ pub fn execute_with_options(
 
 mod leaf;
 mod map_key;
+mod pg_text;
 mod struct_;
 mod union;
 mod util;

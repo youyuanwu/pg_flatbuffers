@@ -357,8 +357,7 @@ pub(super) fn walk_vector_map_keys(
         // meaningless on a vector of struct elements.
         return Err(ExecuteError::UnsupportedType {
             field: field_name.to_string(),
-            type_name:
-                "vector-of-struct element (|keys not supported — use [*] with a struct field)",
+            type_name: "vector-of-struct element (|keys not supported — use [*] with a struct field)",
         });
     }
 

@@ -148,9 +148,13 @@ impl fmt::Display for ParseError {
                 f,
                 "path nesting depth {depth} exceeds limit of {limit} (see pg_flatbuffers.max_path_depth)",
             ),
-            MissingPathSeparator => f.write_str("query missing ':' separator between table and path"),
+            MissingPathSeparator => {
+                f.write_str("query missing ':' separator between table and path")
+            }
             EmptyComponent { what } => write!(f, "empty {what} in query"),
-            TooManyColons => f.write_str("query has too many ':' separators (expected at most two)"),
+            TooManyColons => {
+                f.write_str("query has too many ':' separators (expected at most two)")
+            }
             ExpectedIdentifier { found } => write!(f, "expected identifier, found {found:?}"),
             InvalidFieldId { reason } => write!(f, "invalid field id after '#': {reason}"),
             UnclosedBracket => f.write_str("unclosed '[' in path"),
