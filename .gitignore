@@ -22,3 +22,12 @@ target
 
 .paw
 .pgrx
+
+# pg_regress runtime artifacts (temporary cluster, diff scratch).
+# `expected/` and `sql/` are checked in; everything else is generated
+# per run by `just regress`.
+crates/pg_flatbuffers/tests/pg_regress/tmp_check/
+crates/pg_flatbuffers/tests/pg_regress/results/
+crates/pg_flatbuffers/tests/pg_regress/log/
+crates/pg_flatbuffers/tests/pg_regress/regression.diffs
+crates/pg_flatbuffers/tests/pg_regress/regression.out

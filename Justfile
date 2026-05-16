@@ -65,6 +65,56 @@ run pg=default_pg:
 test pg=default_pg:
     cargo pgrx test {{pg}} --package {{EXT}}
 
+# pg_regress-style end-to-end tests (golden-file diffs against the
+# psql output captured under `expected/`). Installs the extension
+# into the in-repo PG, then drives the Postgres-bundled `pg_regress`
+# binary with `--temp-instance --load-extension` so each run starts
+# from a fresh cluster with `CREATE EXTENSION pg_flatbuffers`
+# already loaded.
+#
+# Regenerate expected files when intentionally changing output:
+#   1. just regress
+#   2. cp crates/pg_flatbuffers/tests/pg_regress/results/*.out \
+#         crates/pg_flatbuffers/tests/pg_regress/expected/
+#   3. just regress  # confirms green
+regress pg=default_pg:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pgcfg="$(just _pg-config {{pg}})"
+    if [[ -z "$pgcfg" || ! -x "$pgcfg" ]]; then
+        echo "no pg_config for {{pg}} — run 'just init' first" >&2
+        exit 1
+    fi
+    pg_root="$(dirname "$(dirname "$pgcfg")")"
+    pg_regress="$pg_root/lib/postgresql/pgxs/src/test/regress/pg_regress"
+    if [[ ! -x "$pg_regress" ]]; then
+        echo "pg_regress not found at $pg_regress" >&2
+        exit 1
+    fi
+    # No --release: pg_regress runs golden-file diffs, not benchmarks,
+    # so the dev profile is fine. Sharing the dev target dir with
+    # `just test pg18` avoids a second full pgrx-pg-sys rebuild
+    # (saves ~1 minute on `just check`).
+    cargo pgrx install --package {{EXT}} --pg-config "$pgcfg"
+    inputdir="crates/{{EXT}}/tests/pg_regress"
+    pushd "$inputdir" >/dev/null
+    rm -rf tmp_check results regression.diffs regression.out log
+    tests=()
+    for f in sql/*.sql; do
+        tests+=("$(basename "$f" .sql)")
+    done
+    if [[ ${#tests[@]} -eq 0 ]]; then
+        echo "no .sql tests in $inputdir/sql/" >&2
+        popd >/dev/null
+        exit 1
+    fi
+    "$pg_regress" \
+        --bindir="$pg_root/bin" \
+        --temp-instance=./tmp_check \
+        --load-extension={{EXT}} \
+        "${tests[@]}"
+    popd >/dev/null
+
 # Alias kept for forward-compat with the v0.2 PG 17 + PG 18 matrix.
 test-all: test
 
@@ -85,9 +135,10 @@ fmt-check:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# CI gate: format check + lint + unit tests + pg18.
+# CI gate: format check + lint + unit tests + pg18 + pg_regress.
 check: fmt-check lint unit
     just test pg18
+    just regress pg18
 
 # ---------------------------------------------------------------------------
 # Packaging

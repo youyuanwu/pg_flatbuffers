@@ -1,0 +1,33 @@
+-- pg_regress: the catalog's least-privilege grants survive install
+-- (see docs/design/catalog-and-schemas.md).
+-- The flatbuffers_admin role exists and is NOLOGIN + NOINHERIT.
+SELECT rolname, rolcanlogin, rolinherit
+FROM   pg_roles
+WHERE  rolname = 'flatbuffers_admin';
+      rolname      | rolcanlogin | rolinherit 
+-------------------+-------------+------------
+ flatbuffers_admin | f           | f
+(1 row)
+
+-- The catalog is owned by flatbuffers_admin.
+SELECT c.relname,
+       r.rolname AS owner
+FROM   pg_class    c
+JOIN   pg_roles    r ON r.oid = c.relowner
+WHERE  c.relname = 'flatbuffers_schemas';
+       relname       |       owner       
+---------------------+-------------------
+ flatbuffers_schemas | flatbuffers_admin
+(1 row)
+
+-- PUBLIC may SELECT but not INSERT / UPDATE / DELETE / TRUNCATE.
+SELECT has_table_privilege('public', 'flatbuffers_schemas', 'SELECT')  AS public_select,
+       has_table_privilege('public', 'flatbuffers_schemas', 'INSERT')  AS public_insert,
+       has_table_privilege('public', 'flatbuffers_schemas', 'UPDATE')  AS public_update,
+       has_table_privilege('public', 'flatbuffers_schemas', 'DELETE')  AS public_delete,
+       has_table_privilege('public', 'flatbuffers_schemas', 'TRUNCATE') AS public_truncate;
+ public_select | public_insert | public_update | public_delete | public_truncate 
+---------------+---------------+---------------+---------------+-----------------
+ t             | f             | f             | f             | f
+(1 row)
+

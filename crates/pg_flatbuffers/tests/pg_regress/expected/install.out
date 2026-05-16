@@ -1,0 +1,36 @@
+-- pg_regress: extension installs, advertises a positive version,
+-- and exports the documented top-level surface.
+SELECT extname FROM pg_extension WHERE extname = 'pg_flatbuffers';
+    extname     
+----------------
+ pg_flatbuffers
+(1 row)
+
+SELECT flatbuffers_extension_version() > 0 AS version_positive;
+ version_positive 
+------------------
+ t
+(1 row)
+
+-- Spot-check that the documented #[pg_extern]s all exist (one row
+-- per function, listed alphabetically for stable diff).
+SELECT proname
+FROM   pg_proc
+WHERE  proname LIKE 'flatbuffers\_%' ESCAPE '\'
+ORDER  BY 1;
+                proname                 
+----------------------------------------
+ flatbuffers_extension_version
+ flatbuffers_from_json
+ flatbuffers_from_json_text
+ flatbuffers_query
+ flatbuffers_query_array
+ flatbuffers_query_multi
+ flatbuffers_root_type
+ flatbuffers_schemas_invalidate_trigger
+ flatbuffers_to_json
+ flatbuffers_to_json_text
+ flatbuffers_validate_schema
+ flatbuffers_verify
+(12 rows)
+

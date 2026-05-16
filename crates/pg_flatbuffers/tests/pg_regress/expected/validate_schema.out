@@ -1,0 +1,37 @@
+-- pg_regress: flatbuffers_validate_schema is the CHECK on
+-- flatbuffers_schemas.bfbs (see docs/design/safety.md).
+-- Use DO + EXCEPTION blocks so the test output is a clean stream of
+-- NOTICEs, not a parade of error-message details that drift across
+-- pgrx / Postgres patch releases.
+-- Direct call: empty bytea is rejected.
+DO $$
+BEGIN
+    PERFORM flatbuffers_validate_schema(''::bytea);
+    RAISE EXCEPTION 'empty bfbs unexpectedly accepted';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'empty bfbs: rejected';
+END$$;
+NOTICE:  empty bfbs: rejected
+-- Direct call: random bytes (too short to be a valid .bfbs) are rejected.
+DO $$
+BEGIN
+    PERFORM flatbuffers_validate_schema('\x0102030405'::bytea);
+    RAISE EXCEPTION 'garbage bfbs unexpectedly accepted';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'garbage bfbs: rejected';
+END$$;
+NOTICE:  garbage bfbs: rejected
+-- Indirect call: the CHECK constraint propagates the rejection
+-- through INSERT. flatbuffers_admin owns the table; SET ROLE so the
+-- INSERT itself is not blocked by the table-level grants.
+SET ROLE flatbuffers_admin;
+DO $$
+BEGIN
+    INSERT INTO flatbuffers_schemas (name, bfbs, root_table)
+    VALUES ('regress_bad', ''::bytea, 'Whatever');
+    RAISE EXCEPTION 'CHECK constraint failed to fire';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'INSERT of empty bfbs: rejected by CHECK';
+END$$;
+NOTICE:  INSERT of empty bfbs: rejected by CHECK
+RESET ROLE;

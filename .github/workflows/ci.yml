@@ -110,7 +110,8 @@ jobs:
         run: cargo pgrx init --pg${{ matrix.pg-major }} download
 
       # `just check` = fmt-check + clippy (warnings → errors) + cargo
-      # test (workspace --lib --bins) + `cargo pgrx test pgN`. See
-      # Justfile.
+      # test (workspace --lib --bins) + `cargo pgrx test pgN` (all
+      # #[pg_test]s) + `just regress pgN` (pg_regress golden-file
+      # end-to-end tests). See Justfile.
       - name: just check
         run: just check
