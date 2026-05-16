@@ -1,8 +1,8 @@
 # Justfile — task runner for pg_flatbuffers
 #
 # Run `just` with no args (or `just list`) to see available recipes.
-# All `cargo pgrx …` recipes target the in-repo Postgres builds under
-# `.pgrx/` (see PGRX_HOME below). No sudo, no system Postgres needed.
+# All `cargo pgrx …` recipes target the Postgres builds under
+# `$PGRX_HOME` (see below). No sudo, no system Postgres needed.
 
 set shell := ["bash", "-cu"]
 set dotenv-load := true
@@ -11,10 +11,12 @@ set dotenv-load := true
 # recipe `foo` in `just/x.just` is invoked as `just foo`.
 import 'just/doctor.just'
 
-# Pin every cargo-pgrx invocation to the repo-local Postgres install
-# created by `just init`. Override by exporting PGRX_HOME before calling
-# just (e.g. to share a single ~/.pgrx/ across repos).
-export PGRX_HOME := env_var_or_default("PGRX_HOME", justfile_directory() / ".pgrx")
+# Pin every cargo-pgrx invocation to a user-global Postgres install at
+# `~/.pgrx` so multiple pgrx repos on the same machine share the same
+# slow-to-build PG tree (~1.5 GB per major). Override by exporting
+# PGRX_HOME before calling just (e.g. PGRX_HOME=$PWD/.pgrx for a
+# repo-isolated install, which is what the CI workflow does).
+export PGRX_HOME := env_var_or_default("PGRX_HOME", env_var("HOME") / ".pgrx")
 
 # The extension crate name; used by `cargo pgrx --package`.
 EXT := "pg_flatbuffers"
@@ -47,7 +49,7 @@ init-one pg=default_pg:
 # Print the resolved pg_config for each provisioned major.
 which-pg:
     @cat "$PGRX_HOME/config.toml" 2>/dev/null || \
-        echo "no $PGRX_HOME/config.toml — run `just init` first"
+        echo "no $PGRX_HOME/config.toml — run 'just init' first"
 
 # ---------------------------------------------------------------------------
 # Build / run / test
