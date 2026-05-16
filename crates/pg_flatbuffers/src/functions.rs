@@ -9,7 +9,7 @@
 //!   `.bfbs` blob,
 //! - [`crate::verify::verify`] for bounded reflection-driven
 //!   verification, and
-//! - [`crate::query::execute`] for the leaf-walking executor.
+//! - [`crate::query::execute_with_options`] for the leaf-walking executor.
 //!
 //! ## Scope of this slice
 //!
@@ -45,8 +45,8 @@
 //!   query invocations share a buffer in one statement; we'll add
 //!   it once usage shows it matters.
 
-use crate::guc::{current_bounds, current_strict};
-use crate::query::{execute, parse, ExecuteError};
+use crate::guc::{current_bounds, current_fill_scalar_defaults, current_strict};
+use crate::query::{execute_with_options, parse, ExecuteError, ExecuteOptions};
 use crate::schema_cache::lookup_schema;
 use crate::verify::verify;
 use pgrx::iter::SetOfIterator;
@@ -63,7 +63,7 @@ const DEFAULT_SCHEMA: &str = "default";
 /// Run `query` against `buf` and return the first leaf as `text`, or
 /// `NULL` when the leaf is absent (the executor produced `None`),
 /// when the executor produced *no* leaves (e.g. `[*]` over an absent
-/// vector, see [`crate::query::execute`]), or when `buf` itself is
+/// vector, see [`crate::query::execute_with_options`]), or when `buf` itself is
 /// empty (the "absent payload" contract, design §10).
 ///
 /// `STRICT` so SQL `NULL` in either argument short-circuits to `NULL`
@@ -74,11 +74,17 @@ const DEFAULT_SCHEMA: &str = "default";
 /// change across statements via `flatbuffers_schemas` writes) but is
 /// stable *within* a single query execution.
 ///
-/// Verifier failure raises `ERROR` (matches `pg_flatbuffers.strict =
-/// on`, the only mode supported today; the GUC slice will add the
-/// `off` branch that returns `NULL` for *structural* failures while
-/// still erroring on bound exceedances — see
-/// [`crate::verify::VerifyError::is_bound_exceedance`]).
+/// Verifier failure raises `ERROR` under the default
+/// `pg_flatbuffers.strict = on`. Under `strict = off`, *structural*
+/// verifier failures return `NULL` (the scan continues) while
+/// *bound* exceedances still raise `ERROR` — see
+/// [`crate::verify::VerifyError::is_bound_exceedance`].
+///
+/// Absent scalar fields read back as their schema default under the
+/// default `pg_flatbuffers.fill_scalar_defaults = on` (FlatBuffers
+/// reader API parity, §4.3). Under `fill_scalar_defaults = off`,
+/// absent scalars surface as SQL `NULL` so callers can distinguish
+/// presence from default.
 #[pg_extern(stable, parallel_safe, strict)]
 fn flatbuffers_query(query: &str, buf: &[u8]) -> Option<String> {
     if buf.is_empty() {
@@ -93,7 +99,13 @@ fn flatbuffers_query(query: &str, buf: &[u8]) -> Option<String> {
     let cached = lookup_schema(schema_name);
     let schema_view = cached.schema();
 
-    let leaves = match execute(buf, &schema_view, &parsed, &current_bounds()) {
+    let leaves = match execute_with_options(
+        buf,
+        &schema_view,
+        &parsed,
+        &current_bounds(),
+        &current_execute_options(),
+    ) {
         Ok(v) => v,
         Err(e) => resolve_execute_error("flatbuffers_query", e, current_strict()),
     };
@@ -135,7 +147,13 @@ fn flatbuffers_query_array(query: &str, buf: &[u8]) -> Vec<String> {
     let cached = lookup_schema(schema_name);
     let schema_view = cached.schema();
 
-    match execute(buf, &schema_view, &parsed, &current_bounds()) {
+    match execute_with_options(
+        buf,
+        &schema_view,
+        &parsed,
+        &current_bounds(),
+        &current_execute_options(),
+    ) {
         Ok(v) => v.into_iter().flatten().collect(),
         Err(e) => resolve_execute_error("flatbuffers_query_array", e, current_strict())
             .into_iter()
@@ -180,7 +198,13 @@ fn flatbuffers_query_multi(query: &str, buf: &[u8]) -> SetOfIterator<'static, St
     let cached = lookup_schema(schema_name);
     let schema_view = cached.schema();
 
-    let leaves = match execute(buf, &schema_view, &parsed, &current_bounds()) {
+    let leaves = match execute_with_options(
+        buf,
+        &schema_view,
+        &parsed,
+        &current_bounds(),
+        &current_execute_options(),
+    ) {
         Ok(v) => v,
         Err(e) => resolve_execute_error("flatbuffers_query_multi", e, current_strict()),
     };
@@ -318,6 +342,16 @@ fn resolve_execute_error(fn_name: &str, e: ExecuteError, strict: bool) -> Vec<Op
         error!("{fn_name}: {e}");
     }
     Vec::new()
+}
+
+/// Materialise an [`ExecuteOptions`] from the current per-session
+/// USERSET GUC values. Called once per public SQL entry point so a
+/// `SET pg_flatbuffers.fill_scalar_defaults = ...` takes effect on
+/// the very next call in the same session.
+fn current_execute_options() -> ExecuteOptions {
+    ExecuteOptions {
+        fill_scalar_defaults: current_fill_scalar_defaults(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1491,7 +1525,7 @@ mod tests {
 
     /// Absent scalar (value == default == 0) round-trips through the
     /// executor's `scalar_default_string` path and back to SQL as the
-    /// schema default.
+    /// schema default (today's `fill_scalar_defaults = on` behaviour).
     #[pg_test]
     fn pg_query_absent_scalar_returns_default() {
         register("default", "T", build_t_schema_bfbs());
@@ -1500,6 +1534,39 @@ mod tests {
             Spi::get_one_with_args::<String>("SELECT flatbuffers_query('T:n', $1)", &[buf.into()])
                 .expect("SPI failure");
         assert_eq!(v.as_deref(), Some("0"));
+    }
+
+    /// `SET pg_flatbuffers.fill_scalar_defaults = off` flips the
+    /// absent-scalar branch from "schema default" to SQL NULL
+    /// (design §4.3 / §10). Same fixture as
+    /// `pg_query_absent_scalar_returns_default`; only the GUC
+    /// changes.
+    #[pg_test]
+    fn pg_query_absent_scalar_returns_null_when_fill_off() {
+        register("default", "T", build_t_schema_bfbs());
+        let buf = build_t_buf(0); // elided slot
+        Spi::run("SET pg_flatbuffers.fill_scalar_defaults = off")
+            .expect("SPI: SET fill_scalar_defaults");
+        let v =
+            Spi::get_one_with_args::<String>("SELECT flatbuffers_query('T:n', $1)", &[buf.into()])
+                .expect("SPI failure");
+        assert!(v.is_none(), "expected NULL under fill_off, got {v:?}");
+    }
+
+    /// `fill_scalar_defaults = off` must not affect *present*
+    /// scalars — including the `n = 42` value from
+    /// `pg_query_happy_path_scalar`. Pins that the GUC gates only
+    /// the absent branch.
+    #[pg_test]
+    fn pg_query_present_scalar_unaffected_by_fill_off() {
+        register("default", "T", build_t_schema_bfbs());
+        let buf = build_t_buf(42); // slot emitted (42 != default 0)
+        Spi::run("SET pg_flatbuffers.fill_scalar_defaults = off")
+            .expect("SPI: SET fill_scalar_defaults");
+        let v =
+            Spi::get_one_with_args::<String>("SELECT flatbuffers_query('T:n', $1)", &[buf.into()])
+                .expect("SPI failure");
+        assert_eq!(v.as_deref(), Some("42"));
     }
 
     /// Garbage bytes must reach the verifier and ERROR (default

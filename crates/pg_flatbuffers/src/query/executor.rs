@@ -84,8 +84,10 @@
 //!   offsets and `flatbuffers::Vector<T>` only handles 32-bit;
 //!   rejected loudly so we don't silently truncate addresses.
 //! - Vectors of unions / vectors of vectors / vectors of arrays.
-//! - The `pg_flatbuffers.proto3_defaults` GUC (§10) — today scalar
-//!   "absent" returns the schema default (postgres-protobuf compat).
+//! - The `pg_flatbuffers.fill_scalar_defaults` GUC (§10) — today
+//!   scalar "absent" returns the schema default (matches the
+//!   FlatBuffers reader API). When the GUC is wired and set to
+//!   `off`, absent scalars surface as SQL NULL instead.
 //!
 //! Pure Rust; no `pgrx` dependency. The Postgres SQL wrappers live in
 //! `functions.rs` (next slice).
@@ -100,7 +102,35 @@ use flatbuffers_reflection::{
 };
 use thiserror::Error;
 
-/// Errors produced by [`execute`].
+/// Read-side knobs threaded through every recursive walker. Bundled
+/// into a struct so adding future per-session settings doesn't
+/// re-churn every walker signature.
+///
+/// The defaults match the pre-GUC executor behaviour byte-for-byte
+/// so the pure-Rust unit tests — which call [`execute_with_options`] directly
+/// rather than going through the GUC layer — keep passing
+/// unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecuteOptions {
+    /// When `true` (the design §10 default, matching the FlatBuffers
+    /// reader API), an absent scalar table field reads back as its
+    /// schema-declared default. When `false`, the field surfaces as
+    /// SQL `NULL` so callers can distinguish presence from default
+    /// (§4.3). The Postgres-side knob is
+    /// `pg_flatbuffers.fill_scalar_defaults` — see
+    /// [`crate::guc::current_fill_scalar_defaults`].
+    pub fill_scalar_defaults: bool,
+}
+
+impl Default for ExecuteOptions {
+    fn default() -> Self {
+        Self {
+            fill_scalar_defaults: true,
+        }
+    }
+}
+
+/// Errors produced by [`execute_with_options`].
 #[derive(Error, Debug)]
 pub enum ExecuteError {
     /// The buffer failed verification under the current bounds.
@@ -160,14 +190,17 @@ pub enum ExecuteError {
 ///   result has length N (or 0 if the vector is absent / empty).
 ///
 /// `bounds` plumbs the per-call resource limits from
-/// `docs/design.md` §10. The caller is responsible for sourcing them
-/// from the GUCs (the GUC slice ships next); for now most callers
-/// pass [`Bounds::default`].
-pub fn execute(
+/// `docs/design.md` §10. `options` carries the per-call read-side
+/// knobs ([`ExecuteOptions`]). Postgres entry points source both
+/// from the GUC layer (see [`crate::guc::current_bounds`] and
+/// [`crate::guc::current_fill_scalar_defaults`]); pure-Rust tests
+/// typically pass [`Bounds::default`] and [`ExecuteOptions::default`].
+pub fn execute_with_options(
     buf: &[u8],
     schema: &Schema<'_>,
     query: &Query,
     bounds: &Bounds,
+    options: &ExecuteOptions,
 ) -> Result<Vec<Option<String>>, ExecuteError> {
     // Verify first; every subsequent unchecked accessor relies on
     // this returning `Ok`.
@@ -182,7 +215,7 @@ pub fn execute(
         .root_table()
         .expect("verify() rejects schemas with no root_table");
 
-    walk_table(&root_table, &root_object, schema, &query.steps)
+    walk_table(&root_table, &root_object, schema, &query.steps, options)
 }
 
 // ---------------------------------------------------------------------------
@@ -191,18 +224,19 @@ pub fn execute(
 
 /// Walk the path `steps` starting from `table` (whose schema shape is
 /// `object`). Returns one or more leaves in wire-format order; see
-/// [`execute`] for the length contract.
+/// [`execute_with_options`] for the length contract.
 ///
 /// # Safety contract
 ///
 /// The caller has already verified the underlying buffer (see
-/// [`execute`]). Every unsafe block in this function is sound under
+/// [`execute_with_options`]). Every unsafe block in this function is sound under
 /// that precondition.
 fn walk_table(
     table: &Table,
     object: &Object,
     schema: &Schema,
     steps: &[Step],
+    options: &ExecuteOptions,
 ) -> Result<Vec<Option<String>>, ExecuteError> {
     let (head, tail) = steps
         .split_first()
@@ -246,10 +280,10 @@ fn walk_table(
     // field is absent in this table instance. This is how we map
     // "field not set" to SQL NULL for nullable types (string,
     // sub-table, vector). Scalar types are handled separately
-    // below: an absent scalar yields its schema default per the
-    // postgres-protobuf-compatible default for `pg_flatbuffers
-    // .proto3_defaults = off` (§4.3, §10). When that GUC slice
-    // lands, the proto3 mode will branch here.
+    // below: an absent scalar yields its schema default by default
+    // (§4.3, matches the FlatBuffers reader API); when
+    // `pg_flatbuffers.fill_scalar_defaults = off` it surfaces as
+    // SQL NULL instead (§10).
     let is_present = table.vtable().get(field.offset()) != 0;
     let is_nullable_type = matches!(
         base_type,
@@ -268,7 +302,7 @@ fn walk_table(
     // under `[*]` it's `vec![]` (no items to fan out over).
     // `walk_vector` handles both cases internally.
     if matches!(base_type, BaseType::Vector | BaseType::Vector64) {
-        return walk_vector(table, &field, schema, tail);
+        return walk_vector(table, &field, schema, tail, options);
     }
 
     if !is_present && is_nullable_type {
@@ -279,14 +313,21 @@ fn walk_table(
 
     if tail.is_empty() {
         if !is_present {
-            // Absent scalar at leaf — synthesize the schema default.
-            // Upstream `get_any_field_string` returns "" for absent
-            // *anything*, so we must source the default from
+            // Absent scalar at leaf — the read-side knob decides
+            // between filling the schema default (FlatBuffers reader
+            // API parity, §4.3) and surfacing SQL NULL
+            // (presence-aware, §10). Upstream `get_any_field_string`
+            // returns "" for absent *anything*, so when we do fill,
+            // we must source the default from
             // `Field::default_integer()` / `default_real()`
             // ourselves. (Required is enforced by the verifier; we
             // never reach here for `field.required() == true`
             // because verification would have failed.)
-            return Ok(vec![Some(scalar_default_string(&field, base_type))]);
+            if options.fill_scalar_defaults {
+                return Ok(vec![Some(scalar_default_string(&field, base_type))]);
+            } else {
+                return Ok(vec![None]);
+            }
         }
         return read_leaf(table, &field, schema, base_type).map(|opt| vec![opt]);
     }
@@ -331,14 +372,14 @@ fn walk_table(
             let child_table_opt =
                 unsafe { get_field_table(table, &field) }.map_err(map_reflection_err)?;
             match child_table_opt {
-                Some(child_table) => walk_table(&child_table, &child_object, schema, tail),
+                Some(child_table) => walk_table(&child_table, &child_object, schema, tail, options),
                 // Defensive: vtable said present, but the deref
                 // returned None. Treat as absent rather than
                 // panicking.
                 None => Ok(vec![None]),
             }
         }
-        BaseType::Union => walk_union(table, &field, schema, tail),
+        BaseType::Union => walk_union(table, &field, schema, tail, options),
         other => Err(ExecuteError::UnsupportedType {
             field: field_name.to_string(),
             type_name: base_type_name(other),
@@ -372,6 +413,7 @@ fn walk_vector(
     field: &Field,
     schema: &Schema,
     steps: &[Step],
+    options: &ExecuteOptions,
 ) -> Result<Vec<Option<String>>, ExecuteError> {
     let field_name = field.name();
 
@@ -404,11 +446,11 @@ fn walk_vector(
 
     match head {
         Step::Index(idx) => {
-            walk_vector_at_index(table, field, schema, *idx, tail, element_base_type)
+            walk_vector_at_index(table, field, schema, *idx, tail, element_base_type, options)
         }
-        Step::All => walk_vector_all(table, field, schema, tail, element_base_type),
+        Step::All => walk_vector_all(table, field, schema, tail, element_base_type, options),
         Step::MapKey(key) => {
-            walk_vector_at_map_key(table, field, schema, key, tail, element_base_type)
+            walk_vector_at_map_key(table, field, schema, key, tail, element_base_type, options)
         }
         Step::MapKeys => walk_vector_map_keys(table, field, schema, tail, element_base_type),
         // `|type` makes no sense on a vector field — vectors aren't
@@ -436,6 +478,7 @@ fn walk_vector_at_index(
     idx: usize,
     tail: &[Step],
     element_base_type: BaseType,
+    options: &ExecuteOptions,
 ) -> Result<Vec<Option<String>>, ExecuteError> {
     let field_name = field.name();
 
@@ -501,7 +544,7 @@ fn walk_vector_at_index(
                 type_name: "vector-of-table element (sub-table at leaf)",
             });
         }
-        return walk_table(&elem_table, &child_object, schema, tail);
+        return walk_table(&elem_table, &child_object, schema, tail, options);
     }
 
     // Scalar / string element types: this *must* be the terminal
@@ -526,6 +569,7 @@ fn walk_vector_all(
     schema: &Schema,
     tail: &[Step],
     element_base_type: BaseType,
+    options: &ExecuteOptions,
 ) -> Result<Vec<Option<String>>, ExecuteError> {
     let field_name = field.name();
 
@@ -584,7 +628,7 @@ fn walk_vector_all(
         // the result further per element.
         let mut out: Vec<Option<String>> = Vec::with_capacity(vec.len());
         for elem_table in vec.iter() {
-            let mut sub = walk_table(&elem_table, &child_object, schema, tail)?;
+            let mut sub = walk_table(&elem_table, &child_object, schema, tail, options)?;
             out.append(&mut sub);
         }
         return Ok(out);
@@ -628,7 +672,7 @@ fn lookup_vector_element_object<'a>(
 ///
 /// # Safety contract
 ///
-/// The caller has verified the buffer (see [`execute`]). When the
+/// The caller has verified the buffer (see [`execute_with_options`]). When the
 /// vtable slot is non-zero, the `u32` at the field location holds a
 /// valid forward offset to a vector body whose first 4 bytes are a
 /// `u32` element count.
@@ -807,6 +851,7 @@ fn walk_vector_at_map_key(
     key: &MapKey,
     tail: &[Step],
     element_base_type: BaseType,
+    options: &ExecuteOptions,
 ) -> Result<Vec<Option<String>>, ExecuteError> {
     let field_name = field.name();
 
@@ -856,7 +901,7 @@ fn walk_vector_at_map_key(
 
     for elem in vec.iter() {
         if key_matches(&elem, &keyed_field, schema, key)? {
-            return walk_table(&elem, &child_object, schema, tail);
+            return walk_table(&elem, &child_object, schema, tail, options);
         }
     }
     // No element matched — short-circuit, same as out-of-range index.
@@ -1326,6 +1371,7 @@ fn walk_union(
     value_field: &Field,
     schema: &Schema,
     tail: &[Step],
+    options: &ExecuteOptions,
 ) -> Result<Vec<Option<String>>, ExecuteError> {
     let field_name = value_field.name();
     let value_slot = value_field.offset();
@@ -1439,7 +1485,7 @@ fn walk_union(
     let value_table_opt =
         unsafe { table.get::<ForwardsUOffset<Table>>(value_field.offset(), None) };
     match value_table_opt {
-        Some(value_table) => walk_table(&value_table, &variant_object, schema, tail),
+        Some(value_table) => walk_table(&value_table, &variant_object, schema, tail, options),
         // Defensive: discriminator non-zero but value slot absent.
         // Verifier would normally have rejected this; treat as `None`
         // rather than panicking on a misclassified malformed buffer.
@@ -1666,9 +1712,9 @@ fn read_leaf(
         | BaseType::String => {
             // SAFETY: see `execute`. `get_any_field_string` reads via
             // the same offset accessors the verifier validated. For
-            // scalars: returns the schema default if absent (that's
-            // the §4.3 behaviour we want under default
-            // `proto3_defaults = off`). For strings: we already
+            // scalars: returns the schema default if absent (the
+            // default §4.3 behaviour with
+            // `fill_scalar_defaults = on`). For strings: we already
             // returned `Ok(None)` above for absent strings, so a
             // returned empty string here means an explicit empty
             // string in the buffer.
@@ -1996,7 +2042,13 @@ mod tests {
     ) -> Result<Vec<Option<String>>, ExecuteError> {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default())
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
     }
 
     // -- happy path: scalar leaves --
@@ -2026,9 +2078,63 @@ mod tests {
         // when value == default.
         let buf = build_order(None, 0, None);
         let v = run("Order:id", &buf, &bfbs).unwrap();
-        // Per design §4.3 with `proto3_defaults = off` (today's
-        // baseline), the default value is returned, NOT NULL.
+        // Per design §4.3 with `fill_scalar_defaults = on` (today's
+        // default), the schema default is returned, NOT NULL.
         assert_eq!(v.as_deref(), Some("0"));
+    }
+
+    /// `fill_scalar_defaults = off` flips the absent-scalar branch
+    /// from "synthesise the schema default" to "surface SQL NULL"
+    /// (design §4.3 / §10). Same fixture as
+    /// `scalar_absent_returns_default` so the difference is purely
+    /// the [`ExecuteOptions`] flag.
+    #[test]
+    fn scalar_absent_returns_null_when_fill_scalar_defaults_off() {
+        let bfbs = build_schema();
+        let buf = build_order(None, 0, None);
+        let schema = root_as_schema(&bfbs).expect("test schema verifies");
+        let query = parse("Order:id").expect("test query parses");
+        let options = ExecuteOptions {
+            fill_scalar_defaults: false,
+        };
+        let leaves = execute_with_options(&buf, &schema, &query, &Bounds::default(), &options)
+            .expect("execute succeeds");
+        assert_eq!(leaves, vec![None]);
+    }
+
+    /// `fill_scalar_defaults = off` must NOT swallow *present*
+    /// scalars whose value happens to be zero. Pins the
+    /// presence-vs-default distinction.
+    #[test]
+    fn scalar_present_zero_is_not_treated_as_absent_when_fill_off() {
+        // Force the writer to actually emit the slot even though
+        // `id == 0` by passing a non-default default — `flatc`
+        // would normally elide a slot that matches the schema
+        // default, but here we go through `push_slot_always`
+        // indirectly by setting the default sentinel to a value
+        // that won't match.
+        let bfbs = build_schema();
+        use flatbuffers::FlatBufferBuilder;
+        let mut fbb = FlatBufferBuilder::new();
+        let t = fbb.start_table();
+        // slot 6 = id; write 0 with default = 1 so the slot is
+        // actually emitted in the vtable.
+        fbb.push_slot::<i32>(6, 0, 1);
+        let order = fbb.end_table(t);
+        fbb.finish_minimal(order);
+        let buf = fbb.finished_data().to_vec();
+
+        let schema = root_as_schema(&bfbs).expect("test schema verifies");
+        let query = parse("Order:id").expect("test query parses");
+        let options = ExecuteOptions {
+            fill_scalar_defaults: false,
+        };
+        let leaves = execute_with_options(&buf, &schema, &query, &Bounds::default(), &options)
+            .expect("execute succeeds");
+        // Present-with-value-0 → "0", not None. (The schema's own
+        // default is still 0; the `1` above is only a builder-side
+        // device to force emission.)
+        assert_eq!(leaves, vec![Some("0".to_owned())]);
     }
 
     // -- happy path: nested table --
@@ -2109,7 +2215,7 @@ mod tests {
         let bfbs = build_schema();
         let buf = build_order(None, 1, None);
         // Synthesize a Query with a `Step::All` even though the
-        // schema has no vector — execute() should still reject
+        // schema has no vector — execute_with_options() should still reject
         // with UnsupportedStep before touching the schema.
         let q = Query {
             schema: None,
@@ -2117,7 +2223,14 @@ mod tests {
             steps: vec![Step::All],
         };
         let schema = root_as_schema(&bfbs).unwrap();
-        let err = execute(&buf, &schema, &q, &Bounds::default()).unwrap_err();
+        let err = execute_with_options(
+            &buf,
+            &schema,
+            &q,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ExecuteError::UnsupportedStep { what: "[*]" }));
     }
 
@@ -2131,7 +2244,14 @@ mod tests {
             steps: vec![Step::MapKey(MapKey::Text("x".to_owned()))],
         };
         let schema = root_as_schema(&bfbs).unwrap();
-        let err = execute(&buf, &schema, &q, &Bounds::default()).unwrap_err();
+        let err = execute_with_options(
+            &buf,
+            &schema,
+            &q,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             ExecuteError::UnsupportedStep { what: "[map-key]" }
@@ -2719,7 +2839,14 @@ mod tests {
     ) -> Result<Option<String>, ExecuteError> {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default()).map(|v| v.into_iter().next().flatten())
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .map(|v| v.into_iter().next().flatten())
     }
 
     /// Test helper: execute against the `Point` schema and return
@@ -2728,7 +2855,14 @@ mod tests {
     fn run_struct_err(query_str: &str, buf: &[u8], bfbs: &[u8]) -> ExecuteError {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default()).unwrap_err()
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .unwrap_err()
     }
 
     /// Test helper: execute against the `Point` schema and unwrap to
@@ -2745,7 +2879,13 @@ mod tests {
     ) -> Result<Vec<Option<String>>, ExecuteError> {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default())
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
     }
 
     // -- vector of strings --
@@ -3684,7 +3824,14 @@ mod tests {
     fn run_union(query_str: &str, buf: &[u8], bfbs: &[u8]) -> Result<Option<String>, ExecuteError> {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default()).map(|v| v.into_iter().next().flatten())
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .map(|v| v.into_iter().next().flatten())
     }
 
     /// Test helper: execute against the union schema and return the
@@ -3692,7 +3839,14 @@ mod tests {
     fn run_union_err(query_str: &str, buf: &[u8], bfbs: &[u8]) -> ExecuteError {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default()).unwrap_err()
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .unwrap_err()
     }
 
     #[test]
@@ -3890,7 +4044,14 @@ mod tests {
             root: "Msg".to_string(),
             steps: vec![Step::UnionType],
         };
-        let err = execute(&buf, &schema, &query, &Bounds::default()).unwrap_err();
+        let err = execute_with_options(
+            &buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, ExecuteError::UnsupportedStep { what } if *what == "|type"),
             "got {err:?}"
@@ -4038,11 +4199,17 @@ mod tests {
     fn run_bag(query_str: &str, buf: &[u8], bfbs: &[u8]) -> Option<String> {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default())
-            .expect("test execute succeeds")
-            .into_iter()
-            .next()
-            .flatten()
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .expect("test execute succeeds")
+        .into_iter()
+        .next()
+        .flatten()
     }
 
     /// Test helper: execute against the `Bag` schema and return the
@@ -4050,7 +4217,14 @@ mod tests {
     fn run_bag_all(query_str: &str, buf: &[u8], bfbs: &[u8]) -> Vec<Option<String>> {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default()).expect("test execute succeeds")
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .expect("test execute succeeds")
     }
 
     /// Test helper: assert that executing `query_str` against the
@@ -4058,7 +4232,14 @@ mod tests {
     fn run_bag_err(query_str: &str, buf: &[u8], bfbs: &[u8]) -> ExecuteError {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default()).unwrap_err()
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .unwrap_err()
     }
 
     fn three_points() -> [TestVec3; 3] {
@@ -4429,23 +4610,43 @@ mod tests {
     fn run_holder(query_str: &str, buf: &[u8], bfbs: &[u8]) -> Option<String> {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default())
-            .expect("test execute succeeds")
-            .into_iter()
-            .next()
-            .flatten()
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .expect("test execute succeeds")
+        .into_iter()
+        .next()
+        .flatten()
     }
 
     fn run_holder_all(query_str: &str, buf: &[u8], bfbs: &[u8]) -> Vec<Option<String>> {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default()).expect("test execute succeeds")
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .expect("test execute succeeds")
     }
 
     fn run_holder_err(query_str: &str, buf: &[u8], bfbs: &[u8]) -> ExecuteError {
         let schema = root_as_schema(bfbs).expect("test schema verifies");
         let query = parse(query_str).expect("test query parses");
-        execute(buf, &schema, &query, &Bounds::default()).unwrap_err()
+        execute_with_options(
+            buf,
+            &schema,
+            &query,
+            &Bounds::default(),
+            &ExecuteOptions::default(),
+        )
+        .unwrap_err()
     }
 
     fn sample_bundle() -> TestBundle {

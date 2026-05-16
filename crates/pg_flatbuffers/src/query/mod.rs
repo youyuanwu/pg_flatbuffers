@@ -26,7 +26,7 @@ pub use ast::{FieldRef, MapKey, ParseError, ParseErrorKind, Query, Step};
     unused_imports,
     reason = "public-API surface; no in-crate consumer routes through `query::*` yet"
 )]
-pub use executor::{execute, ExecuteError};
+pub use executor::{execute_with_options, ExecuteError, ExecuteOptions};
 #[allow(
     unused_imports,
     reason = "public-API surface; bound/length constants will be wired through the deferred GUC plumbing slice (§10)"

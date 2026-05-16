@@ -11,34 +11,37 @@
 //! | `pg_flatbuffers.max_tables` | 1_000_000 | 1..=`i32::MAX` | [`Bounds::max_tables`] |
 //! | `pg_flatbuffers.max_apparent_size_mb` | 64 | 1..=16384 | [`Bounds::max_apparent_size`] (× 1 MiB) |
 //!
-//! Plus one `USERSET` bool:
+//! Plus two `USERSET` bools:
 //!
 //! | GUC | Default | Maps to |
 //! | --- | --- | --- |
 //! | `pg_flatbuffers.strict` | `on` | [`current_strict`] — consumed by [`crate::functions`] to decide whether to ERROR or substitute `NULL` on a structural verifier failure (§10 "strict does not relax bounds"). |
+//! | `pg_flatbuffers.fill_scalar_defaults` | `on` | [`current_fill_scalar_defaults`] — consumed by [`crate::query::execute_with_options`] to decide whether an absent scalar table field reads as its schema default (`on`, matches the FlatBuffers reader API) or as SQL `NULL` (`off`, presence-aware) (§4.3, §10). |
 //!
 //! [`current_bounds`] materialises a [`Bounds`] from the current GUC
-//! values for every call to [`crate::query::execute`] /
+//! values for every call to [`crate::query::execute_with_options`] /
 //! [`crate::verify::verify`] in [`crate::functions`]. The pure-Rust
 //! tests inside [`crate::query::executor`] and [`crate::verify`]
 //! continue to use [`Bounds::default`] directly — they have no
 //! Postgres backend to register GUCs against.
 //!
-//! ## Why `SUSET` for the bounds, `USERSET` for `strict`?
+//! ## Why `SUSET` for the bounds, `USERSET` for `strict` / `fill_scalar_defaults`?
 //!
 //! Per §10 "GUC governance is part of the safety boundary: a bound
 //! that any session can raise is not a bound." The three bounds gate
 //! verifier DoS resistance, so they require superuser to change. The
-//! `strict` GUC, by contrast, only affects the *calling session's*
-//! own results (turning structural failures into `NULL` so a scan
-//! over a mixed-cleanliness column doesn't abort mid-statement). It
-//! cannot weaken the verifier or relax a bound exceedance —
-//! [`crate::verify::VerifyError::is_bound_exceedance`] is still
-//! consulted before substituting `NULL`, so `USERSET` is safe.
+//! two `USERSET` bools, by contrast, only affect the *calling
+//! session's* own results:
 //!
-//! The `pg_flatbuffers.proto3_defaults` `USERSET` GUC that affects
-//! the executor's absent-scalar branch lives in its own future
-//! micro-slice.
+//! - `strict` turns structural failures into `NULL` so a scan over a
+//!   mixed-cleanliness column doesn't abort mid-statement. It cannot
+//!   weaken the verifier or relax a bound exceedance —
+//!   [`crate::verify::VerifyError::is_bound_exceedance`] is still
+//!   consulted before substituting `NULL`.
+//! - `fill_scalar_defaults` selects between two equally-valid
+//!   interpretations of an absent scalar (schema default vs. SQL
+//!   `NULL`) — both are read-side-only and neither weakens any
+//!   safety invariant.
 //!
 //! ## Why `i32` and not `usize`?
 //!
@@ -72,6 +75,15 @@ static MAX_APPARENT_SIZE_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 /// always-ERROR-on-verifier-failure behaviour of
 /// [`crate::functions`].
 static STRICT: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// Backing storage for `pg_flatbuffers.fill_scalar_defaults`.
+/// Default `true` (`on`) matches the FlatBuffers reader API (and
+/// the pre-GUC executor behaviour): an absent scalar table field
+/// reads back as its schema default. `false` (`off`) makes absent
+/// scalars surface as SQL `NULL` instead, so callers can
+/// distinguish "writer set field to 0" from "writer never set
+/// field" (§4.3, §10).
+static FILL_SCALAR_DEFAULTS: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 // -- Upper-bound sanity caps -----------------------------------------------
 //
@@ -140,6 +152,18 @@ pub fn init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_bool_guc(
+        c"pg_flatbuffers.fill_scalar_defaults",
+        c"When on (default), an absent scalar table field reads back as its schema default. When off, it surfaces as SQL NULL instead.",
+        c"Per-session knob (design §4.3, §10). USERSET-safe: read-side \
+          only, affects neither the verifier nor any DoS bound. Selects \
+          between two equally-valid interpretations of an absent scalar \
+          — schema default (matches the FlatBuffers reader API) vs. \
+          SQL NULL (presence-aware).",
+        &FILL_SCALAR_DEFAULTS,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
 }
 
 // -- Read path -------------------------------------------------------------
@@ -169,6 +193,16 @@ pub fn current_bounds() -> Bounds {
 /// and ERRORs on those regardless of `strict`.
 pub fn current_strict() -> bool {
     STRICT.get()
+}
+
+/// Current value of `pg_flatbuffers.fill_scalar_defaults`. `true`
+/// (the default) means an absent scalar table field reads back as
+/// its schema default (FlatBuffers reader API parity, §4.3); `false`
+/// makes it surface as SQL `NULL` so callers can distinguish
+/// presence from default. Consumed by [`crate::functions`] when
+/// building the [`crate::query::ExecuteOptions`] for each call.
+pub fn current_fill_scalar_defaults() -> bool {
+    FILL_SCALAR_DEFAULTS.get()
 }
 
 // -- Tests -----------------------------------------------------------------
@@ -275,5 +309,33 @@ mod tests {
         assert!(!current_strict());
         Spi::run("SET pg_flatbuffers.strict = on").expect("SPI: SET strict back on");
         assert!(current_strict());
+    }
+
+    // -- pg_flatbuffers.fill_scalar_defaults --
+
+    /// Default for `pg_flatbuffers.fill_scalar_defaults` is `on`
+    /// (matches the FlatBuffers reader API and the pre-GUC executor
+    /// behaviour). Boot value is read through
+    /// [`current_fill_scalar_defaults`] to also cover the accessor.
+    #[pg_test]
+    fn pg_guc_fill_scalar_defaults_default_is_on() {
+        assert!(current_fill_scalar_defaults());
+        let v = Spi::get_one::<String>("SHOW pg_flatbuffers.fill_scalar_defaults")
+            .expect("SPI failure")
+            .expect("NULL from SHOW");
+        assert_eq!(v, "on");
+    }
+
+    /// `USERSET` toggling round-trips: `off` flips the accessor, `on`
+    /// restores it. Pins the GUC subsystem actually mutating the
+    /// `GucSetting<bool>` backing storage on `SET`.
+    #[pg_test]
+    fn pg_guc_fill_scalar_defaults_set_takes_effect_in_same_session() {
+        Spi::run("SET pg_flatbuffers.fill_scalar_defaults = off")
+            .expect("SPI: SET fill_scalar_defaults");
+        assert!(!current_fill_scalar_defaults());
+        Spi::run("SET pg_flatbuffers.fill_scalar_defaults = on")
+            .expect("SPI: SET fill_scalar_defaults back on");
+        assert!(current_fill_scalar_defaults());
     }
 }
