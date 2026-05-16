@@ -767,6 +767,135 @@ mod tests {
         fbb.finished_data().to_vec()
     }
 
+    /// Build a vector-of-struct schema for the SQL-side smoke.
+    /// Mirror of the executor's `build_bag_schema` fixture: a
+    /// `table Bag { points: [Vec3] }` over inline `Vec3` structs.
+    /// Object ordering: Bag (0), Vec3 (1).
+    fn build_bag_schema_bfbs() -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        use flatbuffers_reflection::reflection::{
+            BaseType, Enum, Field as RField, FieldArgs, Object as RObject, ObjectArgs,
+            Schema as RSchema, SchemaArgs, Type, TypeArgs,
+        };
+        let mut fbb = FlatBufferBuilder::new();
+
+        let float_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Float,
+                ..Default::default()
+            },
+        );
+
+        // -- struct Vec3 --
+        let x_n = fbb.create_string("x");
+        let x_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(x_n),
+                type_: Some(float_t),
+                id: 0,
+                offset: 0,
+                ..Default::default()
+            },
+        );
+        let y_n = fbb.create_string("y");
+        let y_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(y_n),
+                type_: Some(float_t),
+                id: 1,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let z_n = fbb.create_string("z");
+        let z_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(z_n),
+                type_: Some(float_t),
+                id: 2,
+                offset: 8,
+                ..Default::default()
+            },
+        );
+        let vec3_fields = fbb.create_vector(&[x_f, y_f, z_f]);
+        let vec3_n = fbb.create_string("Vec3");
+        let vec3 = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(vec3_n),
+                fields: Some(vec3_fields),
+                is_struct: true,
+                bytesize: 12,
+                minalign: 4,
+                ..Default::default()
+            },
+        );
+
+        // -- table Bag { points: [Vec3] } --
+        // Vec3 sorts as object index 1 (Bag (0), Vec3 (1)).
+        let points_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::Obj,
+                index: 1,
+                ..Default::default()
+            },
+        );
+        let points_n = fbb.create_string("points");
+        let points_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(points_n),
+                type_: Some(points_t),
+                id: 0,
+                offset: 4, // vtable slot for the only field
+                ..Default::default()
+            },
+        );
+        let bag_fields = fbb.create_vector(&[points_f]);
+        let bag_n = fbb.create_string("Bag");
+        let bag = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(bag_n),
+                fields: Some(bag_fields),
+                ..Default::default()
+            },
+        );
+
+        let objects = fbb.create_vector(&[bag, vec3]);
+        let enums = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum>>(&[]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(bag),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// Build a `Bag` buffer holding the supplied vector of inline
+    /// `Vec3` structs.
+    fn build_bag_buf(points: &[TestVec3]) -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        let mut fbb = FlatBufferBuilder::new();
+        let points_off = fbb.create_vector(points);
+        let t = fbb.start_table();
+        fbb.push_slot_always(4, points_off); // slot 4 = points
+        let bag = fbb.end_table(t);
+        fbb.finish_minimal(bag);
+        fbb.finished_data().to_vec()
+    }
+
     /// Build a tiny union schema for the SQL-side smoke. Same shape
     /// as the executor's `build_union_schema` fixture (table A with
     /// `name:string`, table B with `count:int`, union U over both,
@@ -1315,6 +1444,44 @@ mod tests {
         )
         .expect("SPI failure");
         assert_eq!(v.as_deref(), Some("A"));
+    }
+
+    // -- vector of struct (design §7.2 / §4.3) --
+
+    /// SQL-side smoke for vector-of-struct dispatch: descend into
+    /// the i'th inline struct element and stringify a scalar leaf.
+    /// Full unit coverage of `[*]` fanout, OOB / absent handling,
+    /// and step-shape rejection (struct elements have no `(key)`,
+    /// and there's no v0.1 textual leaf form for a struct element)
+    /// lives in the executor module.
+    #[pg_test]
+    fn pg_query_vector_of_struct_index_field() {
+        register("default", "Bag", build_bag_schema_bfbs());
+        let pts = [
+            TestVec3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            TestVec3 {
+                x: 4.0,
+                y: 5.0,
+                z: 6.0,
+            },
+            TestVec3 {
+                x: 7.0,
+                y: 8.0,
+                z: 9.0,
+            },
+        ];
+        let buf = build_bag_buf(&pts);
+        // Element 1 is {4, 5, 6} — read its `y` (= 5).
+        let v = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Bag:points[1].y', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure");
+        assert_eq!(v.as_deref(), Some("5"));
     }
 
     // -- flatbuffers_query_multi --
