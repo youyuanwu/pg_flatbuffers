@@ -561,17 +561,13 @@ cover the table above with these carve-outs:
   break round-trip through `from_json`.
 - **`from_json` deferrals** (rejected with a `Unsupported` error that
   names the offending field):
-  - **Vectors of structs.** Element stride must equal the struct's
-    exact `bytesize` *and* alignment, so vector-element placement
-    would need const-generic dispatch on the `(size, alignment)`
-    pair rather than `size` alone. Inline placement (table field,
-    union variant) and out-of-line placement (union value) work
-    today via [`crate::from_json::InlineStruct`] with alignment
-    fixed at 8.
-  - **Struct sizes not in the v0.1 dispatch table.** The walker
-    handles the common multiples (1, 2, 3, 4, 6, 8, 10, 12, 14,
-    16, 20, 24, 28, 32, 36, 40, 44, 48, 56, 64, 72, 80, 96, 128,
-    192, 256); unusual sizes raise a clear error.
+  - **Struct sizes / alignments not in the v0.1 dispatch table.** The
+    `(size, align)` table in [`crate::from_json`] covers all common
+    combinations (align ∈ {1, 2, 4, 8}, size up to 256 bytes) for
+    inline placement, out-of-line union values, *and* vector
+    elements. Schemas with unusual `bytesize` × `minalign` pairs
+    (e.g. `(96, 4)`) raise a clear error pointing at the field;
+    extending the table is a one-line addition.
 - **`pg_flatbuffers.from_json_unknown = ignore` GUC** is not yet
   wired — unknown JSON keys always `ERROR`.
 - **`max_apparent_size_mb` cap on output buffer** is not enforced on

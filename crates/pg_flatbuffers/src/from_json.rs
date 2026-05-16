@@ -214,7 +214,13 @@ fn build_table<'fbb>(
         /// Inline struct: raw bytes to copy directly into the
         /// table's body at the field's vtable slot. Sized
         /// dispatch happens in [`push_struct_inline_to_slot`].
-        InlineStruct(Vec<u8>),
+        /// `align` is the struct's `minalign` (used by the
+        /// dispatch macro to pick the right const-generic
+        /// `InlineStruct<N, A>`).
+        InlineStruct {
+            bytes: Vec<u8>,
+            align: usize,
+        },
         UnionPair {
             disc: u8,
             value_off: Option<WIPOffset<UnionWIPOffset>>,
@@ -300,7 +306,8 @@ fn build_table<'fbb>(
                             got: value_kind(value),
                         })?;
                     let bytes = build_struct_bytes(sub_obj, &child_object, schema)?;
-                    pending.push((field, SlotPush::InlineStruct(bytes)));
+                    let align = struct_minalign(&child_object, field_name)?;
+                    pending.push((field, SlotPush::InlineStruct { bytes, align }));
                     continue;
                 }
                 let sub_obj = value
@@ -353,8 +360,8 @@ fn build_table<'fbb>(
             SlotPush::Offset(off) => {
                 fbb.push_slot_always::<WIPOffset<UnionWIPOffset>>(slot, *off);
             }
-            SlotPush::InlineStruct(bytes) => {
-                push_struct_inline_to_slot(fbb, slot, bytes, field.name())?;
+            SlotPush::InlineStruct { bytes, align } => {
+                push_struct_inline_to_slot(fbb, slot, bytes, *align, field.name())?;
             }
             SlotPush::UnionPair { disc, value_off } => {
                 // The discriminator slot is always slot-2 (flatc
@@ -528,10 +535,37 @@ fn build_vector<'fbb>(
             let child_idx = u_index(field.type_().index(), "Vector of Obj")?;
             let child_object = schema.objects().get(child_idx);
             if child_object.is_struct() {
-                return Err(FromJsonError::Unsupported {
-                    field: field_name,
-                    what: "vector of structs (deferred)",
-                });
+                // Vector of inline structs. Build each element's
+                // bytes, concatenate into one buffer, and hand off
+                // to `push_vector_of_structs` which dispatches on
+                // (bytesize, minalign) and uses
+                // `start_vector` + `push` + `end_vector` to write
+                // the correctly-strided element body.
+                let bytesize = usize::try_from(child_object.bytesize()).map_err(|_| {
+                    FromJsonError::Internal(format!(
+                        "vector field {field_name:?} struct element bytesize negative"
+                    ))
+                })?;
+                let align = struct_minalign(&child_object, &field_name)?;
+                let mut all_bytes = Vec::with_capacity(arr.len() * bytesize);
+                for (i, v) in arr.iter().enumerate() {
+                    let sub_obj = v.as_object().ok_or_else(|| FromJsonError::TypeMismatch {
+                        field: format!("{field_name}[{i}]"),
+                        expected: "object",
+                        got: value_kind(v),
+                    })?;
+                    let bytes = build_struct_bytes(sub_obj, &child_object, schema)?;
+                    debug_assert_eq!(bytes.len(), bytesize);
+                    all_bytes.extend_from_slice(&bytes);
+                }
+                return push_vector_of_structs(
+                    fbb,
+                    &all_bytes,
+                    arr.len(),
+                    bytesize,
+                    align,
+                    &field_name,
+                );
             }
             // Vector of tables: pre-build each sub-table.
             let mut offs: Vec<WIPOffset<flatbuffers::TableFinishedWIPOffset>> =
@@ -674,7 +708,8 @@ fn build_union_pair<'fbb>(
                         got: value_kind(value_v),
                     })?;
                 let bytes = build_struct_bytes(sub_obj, &variant_object, schema)?;
-                push_struct_out_of_line(fbb, &bytes, field_name)?
+                let align = struct_minalign(&variant_object, field_name)?;
+                push_struct_out_of_line(fbb, &bytes, align, field_name)?
             } else {
                 let sub_obj = value_v
                     .as_object()
@@ -1490,21 +1525,24 @@ fn out_of_range(field: &Field, n: i64, kind: &'static str) -> FromJsonError {
 // -- inline-struct Push adapter --
 
 /// Const-generic wrapper that implements [`flatbuffers::Push`] for a
-/// raw `[u8; N]`. Used to inject struct bytes into either an inline
-/// table slot ([`push_struct_inline_to_slot`]) or an out-of-line
-/// union-value position ([`push_struct_out_of_line`]).
+/// raw `[u8; N]` with declared alignment `A`. Used for all three
+/// struct placements:
 ///
-/// Alignment is fixed at 8 (the maximum FlatBuffers scalar alignment).
-/// This **over-aligns** structs whose `minalign` is 1/2/4, which is
-/// safe for *single* placements (the slot/uoffset captures the actual
-/// position) but would corrupt the element stride of a vector of
-/// structs — hence the v0.1 deferral of vector-of-struct on the
-/// from_json side.
+/// - inline in a table slot ([`push_struct_inline_to_slot`]),
+/// - out-of-line as a union value ([`push_struct_out_of_line`]),
+/// - inline in a vector body ([`push_vector_of_structs`]).
+///
+/// Vector placement requires the alignment to match the struct's
+/// declared `minalign` exactly so element stride works out
+/// (`bytesize` is always a multiple of `minalign` by the
+/// FlatBuffers schema rules); single placements tolerate
+/// over-alignment, but we still pass the exact `minalign` from
+/// the reflected `Object` for uniformity.
 #[repr(C)]
-struct InlineStruct<const N: usize>([u8; N]);
+struct InlineStruct<const N: usize, const A: usize>([u8; N]);
 
-impl<const N: usize> flatbuffers::Push for InlineStruct<N> {
-    type Output = InlineStruct<N>;
+impl<const N: usize, const A: usize> flatbuffers::Push for InlineStruct<N, A> {
+    type Output = InlineStruct<N, A>;
     // SAFETY contract: caller has made `size()` bytes available in `dst`.
     unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
         dst[..N].copy_from_slice(&self.0);
@@ -1513,56 +1551,90 @@ impl<const N: usize> flatbuffers::Push for InlineStruct<N> {
         N
     }
     fn alignment() -> flatbuffers::PushAlignment {
-        flatbuffers::PushAlignment::new(8)
+        flatbuffers::PushAlignment::new(A)
     }
 }
 
-/// Dispatch macro: copy `bytes` into an `InlineStruct<N>` for a
-/// `bytes.len()` selected from a fixed table of common sizes, then
-/// hand it off to the caller-provided `$action` (push_slot_always or
-/// fbb.push). Unusual sizes return [`FromJsonError::Unsupported`].
+/// Resolve a struct's `minalign` to a `usize` for dispatch, with a
+/// sane fallback for malformed `.bfbs` blobs (negative or zero
+/// minalign).
+fn struct_minalign(object: &Object, field_name: &str) -> Result<usize, FromJsonError> {
+    let m = object.minalign();
+    if m <= 0 {
+        return Err(FromJsonError::Internal(format!(
+            "struct {:?} at field {field_name:?} has non-positive minalign ({m})",
+            object.name()
+        )));
+    }
+    Ok(m as usize)
+}
+
+/// Dispatch macro: copy `bytes` into an `InlineStruct<N, A>` for
+/// the (`bytes.len()`, `align`) pair drawn from a fixed v0.1 table,
+/// then hand it off to the caller-provided `$action`
+/// (`push_slot_always` / `fbb.push` / `start_vector` + per-element
+/// push). Unusual combinations return
+/// [`FromJsonError::Unsupported`].
 macro_rules! dispatch_inline_struct {
-    ($bytes:expr, $field_name:expr, |$arr:ident| $action:expr) => {{
+    ($bytes:expr, $align:expr, $field_name:expr, |$arr:ident| $action:expr) => {{
         macro_rules! arm {
-            ($n:literal) => {{
+            ($n:literal, $a:literal) => {{
                 let mut tmp = [0u8; $n];
                 tmp.copy_from_slice($bytes);
-                let $arr = InlineStruct::<$n>(tmp);
+                let $arr = InlineStruct::<$n, $a>(tmp);
                 $action
             }};
         }
-        match $bytes.len() {
-            1 => arm!(1),
-            2 => arm!(2),
-            3 => arm!(3),
-            4 => arm!(4),
-            6 => arm!(6),
-            8 => arm!(8),
-            10 => arm!(10),
-            12 => arm!(12),
-            14 => arm!(14),
-            16 => arm!(16),
-            20 => arm!(20),
-            24 => arm!(24),
-            28 => arm!(28),
-            32 => arm!(32),
-            36 => arm!(36),
-            40 => arm!(40),
-            44 => arm!(44),
-            48 => arm!(48),
-            56 => arm!(56),
-            64 => arm!(64),
-            72 => arm!(72),
-            80 => arm!(80),
-            96 => arm!(96),
-            128 => arm!(128),
-            192 => arm!(192),
-            256 => arm!(256),
+        match ($bytes.len(), $align) {
+            // align 1
+            (1, 1) => arm!(1, 1),
+            (2, 1) => arm!(2, 1),
+            (3, 1) => arm!(3, 1),
+            (4, 1) => arm!(4, 1),
+            (8, 1) => arm!(8, 1),
+            // align 2
+            (2, 2) => arm!(2, 2),
+            (4, 2) => arm!(4, 2),
+            (6, 2) => arm!(6, 2),
+            (8, 2) => arm!(8, 2),
+            (10, 2) => arm!(10, 2),
+            (12, 2) => arm!(12, 2),
+            (16, 2) => arm!(16, 2),
+            // align 4
+            (4, 4) => arm!(4, 4),
+            (8, 4) => arm!(8, 4),
+            (12, 4) => arm!(12, 4),
+            (16, 4) => arm!(16, 4),
+            (20, 4) => arm!(20, 4),
+            (24, 4) => arm!(24, 4),
+            (28, 4) => arm!(28, 4),
+            (32, 4) => arm!(32, 4),
+            (36, 4) => arm!(36, 4),
+            (40, 4) => arm!(40, 4),
+            (44, 4) => arm!(44, 4),
+            (48, 4) => arm!(48, 4),
+            (56, 4) => arm!(56, 4),
+            (64, 4) => arm!(64, 4),
+            // align 8
+            (8, 8) => arm!(8, 8),
+            (16, 8) => arm!(16, 8),
+            (24, 8) => arm!(24, 8),
+            (32, 8) => arm!(32, 8),
+            (40, 8) => arm!(40, 8),
+            (48, 8) => arm!(48, 8),
+            (56, 8) => arm!(56, 8),
+            (64, 8) => arm!(64, 8),
+            (72, 8) => arm!(72, 8),
+            (80, 8) => arm!(80, 8),
+            (96, 8) => arm!(96, 8),
+            (128, 8) => arm!(128, 8),
+            (192, 8) => arm!(192, 8),
+            (256, 8) => arm!(256, 8),
             other => {
                 let _ = other;
                 return Err(FromJsonError::Unsupported {
                     field: $field_name.to_string(),
-                    what: "struct bytesize not in v0.1 inline dispatch table",
+                    what: "struct (bytesize, minalign) pair not in v0.1 dispatch table",
                 });
             }
         }
@@ -1575,9 +1647,10 @@ fn push_struct_inline_to_slot(
     fbb: &mut FlatBufferBuilder<'_>,
     slot: u16,
     bytes: &[u8],
+    align: usize,
     field_name: &str,
 ) -> Result<(), FromJsonError> {
-    dispatch_inline_struct!(bytes, field_name, |s| {
+    dispatch_inline_struct!(bytes, align, field_name, |s| {
         fbb.push_slot_always(slot, s);
     });
     Ok(())
@@ -1588,14 +1661,108 @@ fn push_struct_inline_to_slot(
 fn push_struct_out_of_line<'fbb>(
     fbb: &mut FlatBufferBuilder<'fbb>,
     bytes: &[u8],
+    align: usize,
     field_name: &str,
 ) -> Result<WIPOffset<UnionWIPOffset>, FromJsonError> {
     let out: WIPOffset<UnionWIPOffset>;
-    dispatch_inline_struct!(bytes, field_name, |s| {
+    dispatch_inline_struct!(bytes, align, field_name, |s| {
         let off = fbb.push(s);
         out = WIPOffset::new(off.value());
     });
     Ok(out)
+}
+
+/// Build a vector of `count` inline structs whose serialised bytes
+/// are `all_bytes` (length `count * bytesize`, contiguous). The
+/// resulting `WIPOffset<UnionWIPOffset>` is what the caller pushes
+/// into the parent table's vector-of-struct vtable slot.
+///
+/// `bytesize` is the per-element stride (from `Object::bytesize`),
+/// `align` is the struct's `minalign`. Element stride must equal
+/// `bytesize` exactly (no over-alignment), which is why this
+/// dispatches on the `(size, align)` pair rather than size alone
+/// (compare with the table-field / union-value paths, which
+/// tolerate over-alignment).
+fn push_vector_of_structs<'fbb>(
+    fbb: &mut FlatBufferBuilder<'fbb>,
+    all_bytes: &[u8],
+    count: usize,
+    bytesize: usize,
+    align: usize,
+    field_name: &str,
+) -> Result<WIPOffset<UnionWIPOffset>, FromJsonError> {
+    debug_assert_eq!(
+        all_bytes.len(),
+        count * bytesize,
+        "push_vector_of_structs: byte buffer must equal count * bytesize"
+    );
+    macro_rules! arm {
+        ($n:literal, $a:literal) => {{
+            fbb.start_vector::<InlineStruct<$n, $a>>(count);
+            // FlatBuffers builds bottom-up, so elements written via
+            // `fbb.push` end up in *reverse* order in the final
+            // buffer. To preserve declaration order, iterate the
+            // input bytes from last element to first.
+            for i in (0..count).rev() {
+                let start = i * bytesize;
+                let mut tmp = [0u8; $n];
+                tmp.copy_from_slice(&all_bytes[start..start + bytesize]);
+                fbb.push(InlineStruct::<$n, $a>(tmp));
+            }
+            let v = fbb.end_vector::<InlineStruct<$n, $a>>(count);
+            return Ok(WIPOffset::new(v.value()));
+        }};
+    }
+    match (bytesize, align) {
+        // align 1
+        (1, 1) => arm!(1, 1),
+        (2, 1) => arm!(2, 1),
+        (3, 1) => arm!(3, 1),
+        (4, 1) => arm!(4, 1),
+        (8, 1) => arm!(8, 1),
+        // align 2
+        (2, 2) => arm!(2, 2),
+        (4, 2) => arm!(4, 2),
+        (6, 2) => arm!(6, 2),
+        (8, 2) => arm!(8, 2),
+        (10, 2) => arm!(10, 2),
+        (12, 2) => arm!(12, 2),
+        (16, 2) => arm!(16, 2),
+        // align 4
+        (4, 4) => arm!(4, 4),
+        (8, 4) => arm!(8, 4),
+        (12, 4) => arm!(12, 4),
+        (16, 4) => arm!(16, 4),
+        (20, 4) => arm!(20, 4),
+        (24, 4) => arm!(24, 4),
+        (28, 4) => arm!(28, 4),
+        (32, 4) => arm!(32, 4),
+        (36, 4) => arm!(36, 4),
+        (40, 4) => arm!(40, 4),
+        (44, 4) => arm!(44, 4),
+        (48, 4) => arm!(48, 4),
+        (56, 4) => arm!(56, 4),
+        (64, 4) => arm!(64, 4),
+        // align 8
+        (8, 8) => arm!(8, 8),
+        (16, 8) => arm!(16, 8),
+        (24, 8) => arm!(24, 8),
+        (32, 8) => arm!(32, 8),
+        (40, 8) => arm!(40, 8),
+        (48, 8) => arm!(48, 8),
+        (56, 8) => arm!(56, 8),
+        (64, 8) => arm!(64, 8),
+        (72, 8) => arm!(72, 8),
+        (80, 8) => arm!(80, 8),
+        (96, 8) => arm!(96, 8),
+        (128, 8) => arm!(128, 8),
+        (192, 8) => arm!(192, 8),
+        (256, 8) => arm!(256, 8),
+        _ => Err(FromJsonError::Unsupported {
+            field: field_name.to_string(),
+            what: "vector-of-struct (bytesize, minalign) pair not in v0.1 dispatch table",
+        }),
+    }
 }
 
 // -- helpers --
@@ -2301,6 +2468,161 @@ mod tests {
         let err = json_to_buf(&json!({ "b": { "arr": [10, 20] } }), &schema, 64).unwrap_err();
         assert!(
             matches!(&err, FromJsonError::IntegerOutOfRange { field, .. } if field == "arr"),
+            "got {err:?}"
+        );
+    }
+
+    /// Build a `table H { points:[Vec3]; }` schema where
+    /// `struct Vec3 { x:float; y:float; z:float }` (bytesize 12,
+    /// minalign 4). Exercises the vector-of-struct path which
+    /// requires exact (size, align) dispatch (vs. inline placement
+    /// which tolerates over-alignment).
+    fn build_vec_of_struct_schema() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let f32_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Float,
+                ..Default::default()
+            },
+        );
+        // struct Vec3 { x:float @0; y:float @4; z:float @8; }
+        let xn = fbb.create_string("x");
+        let xf = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(xn),
+                type_: Some(f32_t),
+                id: 0,
+                offset: 0,
+                ..Default::default()
+            },
+        );
+        let yn = fbb.create_string("y");
+        let yf = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(yn),
+                type_: Some(f32_t),
+                id: 1,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let zn = fbb.create_string("z");
+        let zf = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(zn),
+                type_: Some(f32_t),
+                id: 2,
+                offset: 8,
+                ..Default::default()
+            },
+        );
+        let vec3_fields = fbb.create_vector(&[xf, yf, zf]);
+        let vec3_n = fbb.create_string("Vec3");
+        let vec3 = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(vec3_n),
+                fields: Some(vec3_fields),
+                is_struct: true,
+                bytesize: 12,
+                minalign: 4,
+                ..Default::default()
+            },
+        );
+        // table H { points:[Vec3]; }
+        let vec3_vec_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::Obj,
+                index: 1, // Vec3 (sorts after H)
+                ..Default::default()
+            },
+        );
+        let points_n = fbb.create_string("points");
+        let points_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(points_n),
+                type_: Some(vec3_vec_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let h_fields = fbb.create_vector(&[points_f]);
+        let h_n = fbb.create_string("H");
+        let h_obj = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(h_n),
+                fields: Some(h_fields),
+                ..Default::default()
+            },
+        );
+        // Objects sorted alphabetically: H (0), Vec3 (1).
+        let objects = fbb.create_vector(&[h_obj, vec3]);
+        let enums = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum>>(&[]);
+        let schema_off = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(h_obj),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema_off, None);
+        fbb.finished_data().to_vec()
+    }
+
+    #[test]
+    fn from_json_vector_of_structs_round_trips() {
+        let bfbs = build_vec_of_struct_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let input = json!({
+            "points": [
+                { "x": 1.0, "y": 2.0, "z": 3.0 },
+                { "x": 4.0, "y": 5.0, "z": 6.0 },
+                { "x": 7.0, "y": 8.0, "z": 9.0 },
+            ],
+        });
+        let buf = json_to_buf(&input, &schema, 64).expect("from_json ok");
+        crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
+            .expect("buffer verifies");
+        let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
+        assert_eq!(value, input);
+    }
+
+    #[test]
+    fn from_json_vector_of_structs_empty_array_round_trips() {
+        let bfbs = build_vec_of_struct_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let input = json!({ "points": [] });
+        let buf = json_to_buf(&input, &schema, 64).expect("from_json ok");
+        crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
+            .expect("buffer verifies");
+        let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
+        assert_eq!(value, input);
+    }
+
+    #[test]
+    fn from_json_vector_of_structs_rejects_non_object_element() {
+        let bfbs = build_vec_of_struct_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let err = json_to_buf(
+            &json!({ "points": [{ "x": 1.0, "y": 2.0, "z": 3.0 }, "not an object"] }),
+            &schema,
+            64,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, FromJsonError::TypeMismatch { field, expected, got }
+                if field == "points[1]" && *expected == "object" && *got == "string"),
             "got {err:?}"
         );
     }
