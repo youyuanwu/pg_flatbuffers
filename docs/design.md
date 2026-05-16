@@ -213,10 +213,26 @@ of:
 Differences vs. protobuf:
 
 - **Unions.** A FlatBuffers union field `f: U` is stored as two slots:
-  the discriminator `f_type: U` and the value `f: Table`. The query
-  engine treats `submessage.f` transparently — it reads the
-  discriminator, then routes to the active member. A trailing
-  `.<member_name>` is allowed for explicit disambiguation.
+  the discriminator `f_type: U` and the value `f` (a forward
+  `uoffset_t` to the variant's content). The query engine treats
+  `submessage.f` transparently — it reads the discriminator, then
+  routes to the active member. A trailing `.<member_name>` is allowed
+  for explicit disambiguation.
+  - **Variant kinds.** Three variant kinds are supported (matching the
+    upstream `flatc` set):
+    - **Table variants** (the original union shape) — descent via
+      `walk_table`; reached by `Msg:body.<field>`.
+    - **Struct variants** (`flatc` ≥ 1.12) — descent via `walk_struct`;
+      the union value slot's `uoffset_t` points at *out-of-line*
+      struct bytes (in contrast to a struct *field*, whose bytes are
+      inlined into the parent table's body).
+    - **String variants** (`flatc` ≥ 2.0) — leaf form only; `Msg:body`
+      returns the UTF-8 content directly, since strings carry no
+      sub-fields. Any trailing `.<field>` is rejected as a type-shape
+      error.
+    - The `|type` terminal step returns the active variant's
+      reflected `EnumVal` name (e.g. `"S"`, `"string"`, `"NONE"`) for
+      all variant kinds.
   - **Vectors of unions** (`f: [U]`) use *three* parallel vectors on the
     wire: `f_type` is a `[U]` of discriminators, `f` is a vector of
     table offsets, and a `(deprecated)` length-aligned slot is reserved

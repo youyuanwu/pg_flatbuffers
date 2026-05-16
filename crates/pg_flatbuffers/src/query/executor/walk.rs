@@ -3,7 +3,7 @@
 
 use super::leaf::read_leaf;
 use super::struct_::walk_struct;
-use super::union::{read_union_type_leaf, walk_union};
+use super::union::{read_union_type_leaf, read_union_value_leaf, walk_union};
 use super::util::{base_type_name, find_field, map_reflection_err, scalar_default_string};
 use super::vector::walk_vector;
 use super::{ExecuteError, ExecuteOptions};
@@ -118,6 +118,15 @@ pub(super) fn walk_table(
             } else {
                 return Ok(vec![None]);
             }
+        }
+        // Empty-tail union: instead of going straight to
+        // `read_leaf` (which rejects `BaseType::Union` uniformly
+        // as "no textual leaf form"), peek at the active variant
+        // — string variants render as their UTF-8 content; table
+        // and struct variants still error, but with a hint to
+        // descend with `.field`. See `read_union_value_leaf`.
+        if base_type == BaseType::Union {
+            return read_union_value_leaf(table, &field, schema);
         }
         return read_leaf(table, &field, schema, base_type).map(|opt| vec![opt]);
     }
