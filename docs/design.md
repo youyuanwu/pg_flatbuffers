@@ -235,12 +235,18 @@ Differences vs. protobuf:
       all variant kinds.
   - **Vectors of unions** (`f: [U]`) use *three* parallel vectors on the
     wire: `f_type` is a `[U]` of discriminators, `f` is a vector of
-    table offsets, and a `(deprecated)` length-aligned slot is reserved
-    by `flatc` for compatibility. The executor reads the i-th entry by
-    pairing `f_type[i]` with `f[i]`. Path `field[i]` and `field[*]`
-    behave as expected; per-element type is the union member named by
-    the discriminator. The verifier (see §10) asserts the discriminator
-    and value vectors are the same length.
+    value offsets, and a `(deprecated)` length-aligned slot is reserved
+    by `flatc` for compatibility. The executor would read the i-th
+    entry by pairing `f_type[i]` with `f[i]`. **Deferred to v0.2**:
+    the upstream `flatbuffers-reflection` 0.1.0 verifier has no
+    vector-of-union path (`verify_vector` returns `TypeNotSupported`
+    for `BaseType::Vector` with `element() == BaseType::Union`), and
+    landing it in v0.1 would require either vendoring the upstream
+    verifier or upstreaming a fix and waiting. For now the
+    schema-feature pre-scan in `verify.rs` rejects any schema
+    containing a vector-of-union field with a deterministic error
+    that names the table and field (rather than letting the upstream
+    surface a cryptic `TypeNotSupported`).
 - **Structs.** Struct fields are inlined and have no vtable; the engine
   treats them identically to tables for path traversal purposes but uses
   a faster fixed-offset reader.
@@ -587,9 +593,12 @@ APIs. We always go through the verifier:
   so a malformed reflection blob cannot reach the cache.
 - The verifier additionally checks structural invariants the executor
   relies on: `(key)`-annotated vectors must be sorted by the key field
-  and free of duplicates (see §7.2 step 4); vectors of unions must have
-  matching `_type` and value vector lengths (see §4.3); violations
-  raise `ERROR` unless `pg_flatbuffers.key_lookup_strict = off`.
+  and free of duplicates (see §7.2 step 4); violations raise `ERROR`
+  unless `pg_flatbuffers.key_lookup_strict = off`. Vector-of-union
+  fields are rejected at *schema* registration (`v0.1` deferral; see
+  §4.3) — a v0.2 follow-on will lift this once the upstream
+  `flatbuffers-reflection` verifier (or a vendored fork) gains the
+  matching-length / per-element checks.
 - **Failure semantics.** When the verifier rejects a payload (malformed
   bytes, exceeded bound, broken `(key)` invariant), `query_*` functions
   raise `ERROR` by default; setting `pg_flatbuffers.strict = off` in the
