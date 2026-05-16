@@ -546,22 +546,33 @@ reflection schema rather than shelling out to `flatc`:
 
 #### v0.1 implementation status
 
-`flatbuffers_to_json` / `flatbuffers_to_json_text` are live and cover
-the table above with three carve-outs:
+`flatbuffers_to_json` / `flatbuffers_to_json_text` and
+`flatbuffers_from_json` / `flatbuffers_from_json_text` are live and
+cover the table above with these carve-outs:
 
 - **Vector of `(key)`-annotated tables → JSON object** is rendered as a
   JSON array instead. The object-keying transformation is a deferred
   sugar (compose with PG's `jsonb_object_agg` in SQL for now).
 - **`(hex)` attribute on `[ubyte]`** is not yet honored — `[ubyte]`
-  always renders as base64.
-- **Non-finite floats** (`NaN`, `±Infinity`) raise `ERROR` rather than
-  serializing as a lossy JSON string. They have no native JSON
-  representation, and silently coercing them would break round-trip
-  through `from_json`. Callers with non-finite values must use the
-  per-field accessor functions.
+  always uses base64 (both directions).
+- **Non-finite floats** (`NaN`, `±Infinity`) raise `ERROR` on the
+  `to_json` side rather than serializing as a lossy JSON string. They
+  have no native JSON representation, and silently coercing them would
+  break round-trip through `from_json`.
+- **`from_json` deferrals** (rejected with a `Unsupported` error that
+  names the offending field):
+  - inline struct fields in tables (e.g. `Point { pos:Vec3 }`),
+  - vectors of structs,
+  - struct union variants,
+  - fixed-size arrays (only legal inside structs).
 
-`flatbuffers_from_json` / `flatbuffers_from_json_text` are still on
-the roadmap; the policies below specify them.
+  Adding struct support requires const-generic `Push` dispatch on the
+  struct's `bytesize`; a follow-up commit will land it.
+- **`pg_flatbuffers.from_json_unknown = ignore` GUC** is not yet
+  wired — unknown JSON keys always `ERROR`.
+- **`max_apparent_size_mb` cap on output buffer** is not enforced on
+  the `from_json` side yet; nesting is capped via the existing
+  `max_depth` GUC.
 
 ### `from_json` policies
 

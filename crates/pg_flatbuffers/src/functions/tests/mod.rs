@@ -8,6 +8,7 @@
 
 mod fixtures;
 
+mod from_json;
 mod guc;
 mod query;
 mod query_array;

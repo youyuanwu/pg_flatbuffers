@@ -25,11 +25,13 @@
 //!   registered root-table name.
 //! - [`flatbuffers_to_json`] / [`flatbuffers_to_json_text`] —
 //!   reflection-driven FlatBuffer → JSON conversion (design §8).
+//! - [`flatbuffers_from_json`] / [`flatbuffers_from_json_text`] —
+//!   reflection-driven JSON → FlatBuffer conversion (design §8,
+//!   inverse of the previous pair).
 //!
 //! ### Deliberately deferred (each gets its own micro-slice)
 //!
-//! - `flatbuffers_from_json{,_text}` — live in a future
-//!   `from_json.rs` slice.
+//! - GUC plumbing for [`crate::verify::Bounds`]: each entry point
 //! - GUC plumbing for [`crate::verify::Bounds`]: each entry point
 //!   calls [`crate::guc::current_bounds`], which materialises a
 //!   [`crate::verify::Bounds`] from the three `SUSET` GUCs
@@ -50,6 +52,7 @@
 /// Matches `docs/design.md` §4.3.
 pub(super) const DEFAULT_SCHEMA: &str = "default";
 
+mod from_json;
 mod query;
 mod query_array;
 mod query_multi;

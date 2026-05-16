@@ -11,6 +11,7 @@ use pgrx::prelude::*;
 ::pgrx::pg_module_magic!(name, version);
 
 mod catalog;
+mod from_json;
 mod functions;
 mod guc;
 mod query;
