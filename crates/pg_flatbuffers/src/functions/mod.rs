@@ -58,11 +58,24 @@ mod verify;
 
 // `#[pg_schema]` requires an inline `mod { ... }` body (it's a
 // proc-macro that rewrites the module token tree), so we can't use
-// `mod tests;`. `include!` pulls the test body in from a sibling
-// file so the tests stay out of this file without losing the SQL
-// schema that pgrx-tests needs to discover them.
+// `mod tests;`. Each per-area file is `include!`d as a chunk of
+// code pasted into the inline body, keeping the test surface split
+// across files while pgrx-tests still sees a single `tests` mod
+// (it issues `SELECT tests.<fn>()` to drive each `#[pg_test]`).
+//
+// `preamble.rs` brings `use pgrx::prelude::*;` into scope for the
+// whole module; `fixtures.rs` defines the schema / buffer builders
+// and the `register` SPI helper shared by every entry-point file.
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
-    include!("tests.rs");
+    include!("tests/preamble.rs");
+    include!("tests/fixtures.rs");
+    include!("tests/query.rs");
+    include!("tests/query_array.rs");
+    include!("tests/query_multi.rs");
+    include!("tests/verify.rs");
+    include!("tests/root_type.rs");
+    include!("tests/guc.rs");
+    include!("tests/vector64.rs");
 }
