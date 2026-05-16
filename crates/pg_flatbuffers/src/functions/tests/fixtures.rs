@@ -1,10 +1,12 @@
+//! Shared fixtures for `functions::tests` submodules: schema/buffer
+//! builders, helper structs, and the `register` SPI helper. All items
+//! are `pub(super)` so each per-area submodule can `use super::fixtures::*`.
 
-// -- fixtures (built inline so this test module has no shared
-//    state with the executor's pure-Rust fixtures) --
+use pgrx::prelude::*;
 
 /// Build a trivial schema with one table `T { n: int = 0; }` and
 /// `T` as the root. Returns the `.bfbs` bytes.
-fn build_t_schema_bfbs() -> Vec<u8> {
+pub(super) fn build_t_schema_bfbs() -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers_reflection::reflection::{
         BaseType, Enum, Field, FieldArgs, Object, ObjectArgs, Schema, SchemaArgs, Type, TypeArgs,
@@ -57,7 +59,7 @@ fn build_t_schema_bfbs() -> Vec<u8> {
 /// Build a `T { n: <value> }` buffer. When `value` equals the
 /// schema default (0), the field is *elided* — used to exercise
 /// the absent-scalar default path through the SQL layer.
-fn build_t_buf(value: i32) -> Vec<u8> {
+pub(super) fn build_t_buf(value: i32) -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     let mut fbb = FlatBufferBuilder::new();
     let t = fbb.start_table();
@@ -70,7 +72,7 @@ fn build_t_buf(value: i32) -> Vec<u8> {
 /// Build a `B { tags: [string]; }` schema rooted at `B`. Used by
 /// the `flatbuffers_query_array` tests to exercise `Step::All`
 /// fanout end-to-end through SQL.
-fn build_b_schema_bfbs() -> Vec<u8> {
+pub(super) fn build_b_schema_bfbs() -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers_reflection::reflection::{
         BaseType, Enum, Field, FieldArgs, Object, ObjectArgs, Schema, SchemaArgs, Type, TypeArgs,
@@ -123,7 +125,7 @@ fn build_b_schema_bfbs() -> Vec<u8> {
 
 /// Build a `B { tags: <tags?> }` buffer. `None` elides the
 /// vector; `Some(&[])` emits an empty vector.
-fn build_b_buf(tags: Option<&[&str]>) -> Vec<u8> {
+pub(super) fn build_b_buf(tags: Option<&[&str]>) -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     let mut fbb = FlatBufferBuilder::new();
     let tags_off = tags.map(|ts| {
@@ -143,7 +145,7 @@ fn build_b_buf(tags: Option<&[&str]>) -> Vec<u8> {
 /// `Entry { name: string (key); }` exists specifically so the
 /// `flatbuffers_query` SQL tests can exercise `Step::MapKey`.
 /// Object index 0 is `Catalog`, 1 is `Entry` (alphabetical).
-fn build_catalog_schema_bfbs() -> Vec<u8> {
+pub(super) fn build_catalog_schema_bfbs() -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers_reflection::reflection::{
         BaseType, Enum, Field, FieldArgs, Object, ObjectArgs, Schema, SchemaArgs, Type, TypeArgs,
@@ -231,7 +233,7 @@ fn build_catalog_schema_bfbs() -> Vec<u8> {
 }
 
 /// Build a `Catalog` buffer with one `Entry` per supplied name.
-fn build_catalog_buf(names: &[&str]) -> Vec<u8> {
+pub(super) fn build_catalog_buf(names: &[&str]) -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     let mut fbb = FlatBufferBuilder::new();
     let entry_offs: Vec<_> = names
@@ -263,7 +265,7 @@ fn build_catalog_buf(names: &[&str]) -> Vec<u8> {
 /// leaves by id, absent / index / keys rejection) lives in the
 /// executor module; this fixture exists purely to exercise the
 /// SQL surface end-to-end.
-fn build_point_schema_bfbs() -> Vec<u8> {
+pub(super) fn build_point_schema_bfbs() -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers_reflection::reflection::{
         BaseType, Enum, Field as RField, FieldArgs, Object as RObject, ObjectArgs,
@@ -398,10 +400,10 @@ fn build_point_schema_bfbs() -> Vec<u8> {
 /// for structs (no compiler padding).
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-struct TestVec3 {
-    x: f32,
-    y: f32,
-    z: f32,
+pub(super) struct TestVec3 {
+    pub(super) x: f32,
+    pub(super) y: f32,
+    pub(super) z: f32,
 }
 
 // SAFETY: `repr(C, packed)` makes the in-memory bytes match the
@@ -418,7 +420,7 @@ impl flatbuffers::Push for TestVec3 {
 }
 
 /// Build a `Point` buffer with the supplied name and pos.
-fn build_point_buf(name: &str, pos: TestVec3) -> Vec<u8> {
+pub(super) fn build_point_buf(name: &str, pos: TestVec3) -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     let mut fbb = FlatBufferBuilder::new();
     let name_off = fbb.create_string(name);
@@ -434,7 +436,7 @@ fn build_point_buf(name: &str, pos: TestVec3) -> Vec<u8> {
 /// Mirror of the executor's `build_bag_schema` fixture: a
 /// `table Bag { points: [Vec3] }` over inline `Vec3` structs.
 /// Object ordering: Bag (0), Vec3 (1).
-fn build_bag_schema_bfbs() -> Vec<u8> {
+pub(super) fn build_bag_schema_bfbs() -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers_reflection::reflection::{
         BaseType, Enum, Field as RField, FieldArgs, Object as RObject, ObjectArgs,
@@ -548,7 +550,7 @@ fn build_bag_schema_bfbs() -> Vec<u8> {
 
 /// Build a `Bag` buffer holding the supplied vector of inline
 /// `Vec3` structs.
-fn build_bag_buf(points: &[TestVec3]) -> Vec<u8> {
+pub(super) fn build_bag_buf(points: &[TestVec3]) -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     let mut fbb = FlatBufferBuilder::new();
     let points_off = fbb.create_vector(points);
@@ -572,7 +574,7 @@ fn build_bag_buf(points: &[TestVec3]) -> Vec<u8> {
 /// ```
 ///
 /// Object ordering: Bundle (0), Holder (1), Vec3 (2).
-fn build_holder_schema_bfbs() -> Vec<u8> {
+pub(super) fn build_holder_schema_bfbs() -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers_reflection::reflection::{
         BaseType, Enum, Field as RField, FieldArgs, Object as RObject, ObjectArgs,
@@ -744,9 +746,9 @@ fn build_holder_schema_bfbs() -> Vec<u8> {
 /// Mirror of the `Bundle` struct above.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-struct TestBundle {
-    xs: [f32; 3],
-    pts: [TestVec3; 2],
+pub(super) struct TestBundle {
+    pub(super) xs: [f32; 3],
+    pub(super) pts: [TestVec3; 2],
 }
 
 // SAFETY: see [`TestVec3`].
@@ -762,7 +764,7 @@ impl flatbuffers::Push for TestBundle {
 }
 
 /// Build a `Holder` buffer containing the supplied `Bundle`.
-fn build_holder_buf(b: TestBundle) -> Vec<u8> {
+pub(super) fn build_holder_buf(b: TestBundle) -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     let mut fbb = FlatBufferBuilder::new();
     let t = fbb.start_table();
@@ -779,7 +781,7 @@ fn build_holder_buf(b: TestBundle) -> Vec<u8> {
 /// Msg (2). Enum index for U: 0. Full coverage of dispatch /
 /// NONE / not-in-variant / step-shape rejection lives in the
 /// executor module; this fixture only exercises the SQL surface.
-fn build_msg_schema_bfbs() -> Vec<u8> {
+pub(super) fn build_msg_schema_bfbs() -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers_reflection::reflection::{
         BaseType, Enum, EnumArgs, EnumVal, EnumValArgs, Field as RField, FieldArgs,
@@ -991,7 +993,7 @@ fn build_msg_schema_bfbs() -> Vec<u8> {
 
 /// Build a `Msg` buffer carrying a `TableA { name }` variant.
 /// Discriminator at slot 4 = 1, value sub-table offset at slot 6.
-fn build_msg_buf_a(name: &str) -> Vec<u8> {
+pub(super) fn build_msg_buf_a(name: &str) -> Vec<u8> {
     use flatbuffers::FlatBufferBuilder;
     let mut fbb = FlatBufferBuilder::new();
     let name_off = fbb.create_string(name);
@@ -1011,7 +1013,7 @@ fn build_msg_buf_a(name: &str) -> Vec<u8> {
 /// Register `bfbs` as schema `name` rooted at `root_table` via
 /// SPI. Tests run as superuser (pgrx-tests default), so the role
 /// check on `flatbuffers_schemas` is bypassed.
-fn register(name: &str, root_table: &str, bfbs: Vec<u8>) {
+pub(super) fn register(name: &str, root_table: &str, bfbs: Vec<u8>) {
     Spi::run_with_args(
         "INSERT INTO flatbuffers_schemas (name, bfbs, root_table) \
          VALUES ($1, $2, $3)",
