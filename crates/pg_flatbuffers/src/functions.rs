@@ -45,7 +45,9 @@
 //!   query invocations share a buffer in one statement; we'll add
 //!   it once usage shows it matters.
 
-use crate::guc::{current_bounds, current_fill_scalar_defaults, current_strict};
+use crate::guc::{
+    current_bounds, current_fill_scalar_defaults, current_key_lookup_strict, current_strict,
+};
 use crate::query::{execute_with_options, parse, ExecuteError, ExecuteOptions};
 use crate::schema_cache::lookup_schema;
 use crate::verify::verify;
@@ -368,11 +370,13 @@ fn resolve_execute_error(fn_name: &str, e: ExecuteError, strict: bool) -> Vec<Op
 
 /// Materialise an [`ExecuteOptions`] from the current per-session
 /// USERSET GUC values. Called once per public SQL entry point so a
-/// `SET pg_flatbuffers.fill_scalar_defaults = ...` takes effect on
-/// the very next call in the same session.
+/// `SET pg_flatbuffers.fill_scalar_defaults = ...` or `SET
+/// pg_flatbuffers.key_lookup_strict = ...` takes effect on the very
+/// next call in the same session.
 fn current_execute_options() -> ExecuteOptions {
     ExecuteOptions {
         fill_scalar_defaults: current_fill_scalar_defaults(),
+        key_lookup_strict: current_key_lookup_strict(),
     }
 }
 
@@ -1790,6 +1794,49 @@ mod tests {
         )
         .expect("SPI failure");
         assert!(v.is_none(), "got {v:?}");
+    }
+
+    /// Default `key_lookup_strict = on` bisects the (key)-vector
+    /// under the FlatBuffers sorted contract. A writer that emitted
+    /// an unsorted vector will see *silent misses* on keys whose
+    /// position the bisect can't reach — pin that behaviour so the
+    /// operator-visible signal (`escalate to key_lookup_strict =
+    /// off`) is reachable, and so a regression that fell back to
+    /// linear scan under strict-on would surface.
+    #[pg_test]
+    fn pg_query_map_key_unsorted_silent_miss_under_default() {
+        register("default", "Catalog", build_catalog_schema_bfbs());
+        // "alpha" precedes "beta" / "gamma" lexicographically but
+        // sits at the tail — same trace as the executor's
+        // `vector_map_key_binary_search_unsorted_silent_miss`.
+        let buf = build_catalog_buf(&["gamma", "beta", "alpha"]);
+        let v = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Catalog:entries[alpha].name', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure");
+        assert!(
+            v.is_none(),
+            "binary search on unsorted vec must silently miss; got {v:?}",
+        );
+    }
+
+    /// `SET pg_flatbuffers.key_lookup_strict = off` flips the
+    /// executor to linear scan, which finds the key regardless of
+    /// vector order. End-to-end smoke that the GUC reaches the
+    /// executor through `current_execute_options` on the very next
+    /// SQL call.
+    #[pg_test]
+    fn pg_query_map_key_unsorted_found_under_key_lookup_strict_off() {
+        register("default", "Catalog", build_catalog_schema_bfbs());
+        let buf = build_catalog_buf(&["gamma", "beta", "alpha"]);
+        Spi::run("SET pg_flatbuffers.key_lookup_strict = off").expect("SPI: SET key_lookup_strict");
+        let v = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Catalog:entries[alpha].name', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure");
+        assert_eq!(v.as_deref(), Some("alpha"));
     }
 
     /// `field|keys` enumerates the `(key)`-annotated field of every

@@ -11,12 +11,13 @@
 //! | `pg_flatbuffers.max_tables` | 1_000_000 | 1..=`i32::MAX` | [`Bounds::max_tables`] |
 //! | `pg_flatbuffers.max_apparent_size_mb` | 64 | 1..=16384 | [`Bounds::max_apparent_size`] (× 1 MiB) |
 //!
-//! Plus two `USERSET` bools:
+//! Plus three `USERSET` bools:
 //!
 //! | GUC | Default | Maps to |
 //! | --- | --- | --- |
 //! | `pg_flatbuffers.strict` | `on` | [`current_strict`] — consumed by [`crate::functions`] to decide whether to ERROR or substitute `NULL` on a structural verifier failure (§10 "strict does not relax bounds"). |
 //! | `pg_flatbuffers.fill_scalar_defaults` | `on` | [`current_fill_scalar_defaults`] — consumed by [`crate::query::execute_with_options`] to decide whether an absent scalar table field reads as its schema default (`on`, matches the FlatBuffers reader API) or as SQL `NULL` (`off`, presence-aware) (§4.3, §10). |
+//! | `pg_flatbuffers.key_lookup_strict` | `on` | [`current_key_lookup_strict`] — consumed by [`crate::query::execute_with_options`] to pick between binary search over `(key)`-sorted vectors (`on`, matches the FlatBuffers reader API's `LookupByKey`) or a linear scan that tolerates unsorted vectors (`off`, correct but O(n)) (§7.2 step 4, §10). |
 //!
 //! [`current_bounds`] materialises a [`Bounds`] from the current GUC
 //! values for every call to [`crate::query::execute_with_options`] /
@@ -25,12 +26,12 @@
 //! continue to use [`Bounds::default`] directly — they have no
 //! Postgres backend to register GUCs against.
 //!
-//! ## Why `SUSET` for the bounds, `USERSET` for `strict` / `fill_scalar_defaults`?
+//! ## Why `SUSET` for the bounds, `USERSET` for `strict` / `fill_scalar_defaults` / `key_lookup_strict`?
 //!
 //! Per §10 "GUC governance is part of the safety boundary: a bound
 //! that any session can raise is not a bound." The three bounds gate
 //! verifier DoS resistance, so they require superuser to change. The
-//! two `USERSET` bools, by contrast, only affect the *calling
+//! three `USERSET` bools, by contrast, only affect the *calling
 //! session's* own results:
 //!
 //! - `strict` turns structural failures into `NULL` so a scan over a
@@ -42,6 +43,15 @@
 //!   interpretations of an absent scalar (schema default vs. SQL
 //!   `NULL`) — both are read-side-only and neither weakens any
 //!   safety invariant.
+//! - `key_lookup_strict` selects between binary search (assumes the
+//!   vector is `(key)`-sorted per the FlatBuffers spec) and linear
+//!   scan (correct on any vector but O(n)). The verifier does not
+//!   yet check sortedness, so `off` is the safe escape hatch for
+//!   payloads from a writer that violated the contract; `on` is the
+//!   performance default that matches every standard FlatBuffers
+//!   `LookupByKey` accessor. Read-side only — cannot weaken any
+//!   safety invariant; the worst case under `on` against an
+//!   unsorted vector is a silent miss, never a buffer over-read.
 //!
 //! ## Why `i32` and not `usize`?
 //!
@@ -84,6 +94,15 @@ static STRICT: GucSetting<bool> = GucSetting::<bool>::new(true);
 /// distinguish "writer set field to 0" from "writer never set
 /// field" (§4.3, §10).
 static FILL_SCALAR_DEFAULTS: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// Backing storage for `pg_flatbuffers.key_lookup_strict`. Default
+/// `true` (`on`) means `field[key]` lookups bisect a
+/// `(key)`-annotated vector under the FlatBuffers contract that the
+/// vector is key-sorted (matches the upstream `LookupByKey`
+/// accessor). `false` (`off`) falls back to a linear scan that is
+/// correct on any vector but O(n). Read-side only; cannot weaken
+/// any safety invariant (§7.2 step 4, §10).
+static KEY_LOOKUP_STRICT: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 // -- Upper-bound sanity caps -----------------------------------------------
 //
@@ -164,6 +183,20 @@ pub fn init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_bool_guc(
+        c"pg_flatbuffers.key_lookup_strict",
+        c"When on (default), field[key] lookups bisect the vector under the FlatBuffers (key)-sorted contract. When off, fall back to a linear scan.",
+        c"Per-session knob (design §7.2 step 4, §10). USERSET-safe: \
+          read-side only, neither weakens the verifier nor relaxes any \
+          DoS bound. The verifier does not yet check vector \
+          sortedness, so the on-mode worst case against a writer that \
+          violated the (key)-sorted contract is a silent miss, never a \
+          buffer over-read. Off-mode trades O(log n) for O(n) and is \
+          correct on any vector.",
+        &KEY_LOOKUP_STRICT,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
 }
 
 // -- Read path -------------------------------------------------------------
@@ -203,6 +236,15 @@ pub fn current_strict() -> bool {
 /// building the [`crate::query::ExecuteOptions`] for each call.
 pub fn current_fill_scalar_defaults() -> bool {
     FILL_SCALAR_DEFAULTS.get()
+}
+
+/// Current value of `pg_flatbuffers.key_lookup_strict`. `true` (the
+/// default) means `field[key]` lookups bisect the vector assuming
+/// the FlatBuffers `(key)`-sorted contract. `false` falls back to a
+/// linear scan. Consumed by [`crate::functions`] when building the
+/// [`crate::query::ExecuteOptions`] for each call.
+pub fn current_key_lookup_strict() -> bool {
+    KEY_LOOKUP_STRICT.get()
 }
 
 // -- Tests -----------------------------------------------------------------
@@ -337,5 +379,30 @@ mod tests {
         Spi::run("SET pg_flatbuffers.fill_scalar_defaults = on")
             .expect("SPI: SET fill_scalar_defaults back on");
         assert!(current_fill_scalar_defaults());
+    }
+
+    // -- pg_flatbuffers.key_lookup_strict --
+
+    /// Default for `pg_flatbuffers.key_lookup_strict` is `on`
+    /// (binary search; matches the FlatBuffers reader API's
+    /// `LookupByKey`). Boot value is read through
+    /// [`current_key_lookup_strict`] to also cover the accessor.
+    #[pg_test]
+    fn pg_guc_key_lookup_strict_default_is_on() {
+        assert!(current_key_lookup_strict());
+        let v = Spi::get_one::<String>("SHOW pg_flatbuffers.key_lookup_strict")
+            .expect("SPI failure")
+            .expect("NULL from SHOW");
+        assert_eq!(v, "on");
+    }
+
+    /// `USERSET` toggling round-trips.
+    #[pg_test]
+    fn pg_guc_key_lookup_strict_set_takes_effect_in_same_session() {
+        Spi::run("SET pg_flatbuffers.key_lookup_strict = off").expect("SPI: SET key_lookup_strict");
+        assert!(!current_key_lookup_strict());
+        Spi::run("SET pg_flatbuffers.key_lookup_strict = on")
+            .expect("SPI: SET key_lookup_strict back on");
+        assert!(current_key_lookup_strict());
     }
 }

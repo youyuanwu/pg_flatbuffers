@@ -100,6 +100,7 @@ use flatbuffers_reflection::reflection::{BaseType, Field, Object, Schema};
 use flatbuffers_reflection::{
     get_any_field_string, get_any_root, get_field_table, get_field_vector, FlatbufferError,
 };
+use std::cmp::Ordering;
 use thiserror::Error;
 
 /// Read-side knobs threaded through every recursive walker. Bundled
@@ -120,12 +121,23 @@ pub struct ExecuteOptions {
     /// `pg_flatbuffers.fill_scalar_defaults` — see
     /// [`crate::guc::current_fill_scalar_defaults`].
     pub fill_scalar_defaults: bool,
+
+    /// When `true` (the design §10 default, matching the FlatBuffers
+    /// reader API's `LookupByKey`), `field[key]` lookups bisect a
+    /// `(key)`-annotated vector under the FlatBuffers contract that
+    /// the vector is key-sorted. When `false`, falls back to a
+    /// linear scan that is correct on any vector but O(n) (§7.2
+    /// step 4). The Postgres-side knob is
+    /// `pg_flatbuffers.key_lookup_strict` — see
+    /// [`crate::guc::current_key_lookup_strict`].
+    pub key_lookup_strict: bool,
 }
 
 impl Default for ExecuteOptions {
     fn default() -> Self {
         Self {
             fill_scalar_defaults: true,
+            key_lookup_strict: true,
         }
     }
 }
@@ -842,16 +854,106 @@ fn is_integer_base(b: BaseType) -> bool {
     )
 }
 
-/// `field[abc]` — find the entry whose `(key)`-annotated field
-/// equals `key` (linear scan, first match in wire order). The
-/// design (§7.2 step 4) calls for binary search over `(key)`-sorted
-/// vectors, but that's gated on a verifier check that the vector is
-/// actually sorted. Until that check lands, we use the
-/// `pg_flatbuffers.key_lookup_strict = off` semantics from §10
-/// unconditionally — correct on any buffer, just O(n) per lookup.
+/// AST `MapKey` projected onto the keyed field's natural comparison
+/// type. Built once per lookup by [`compile_key`] and consumed by
+/// [`compare_actual_to_compiled`] inside the binary-search loop.
+enum CompiledKey<'a> {
+    /// String-keyed field: compare actual bytes against the key
+    /// lexicographically. Borrowed from the AST so no allocation
+    /// occurs in the hot loop.
+    Text(&'a str),
+    /// Integer-keyed field: compare actual (parsed from the field's
+    /// formatted decimal) against the key numerically. Numeric
+    /// rather than lexicographic so `[42]` matches stored 42
+    /// regardless of leading-zero / sign-formatting differences and
+    /// so the bisect's comparator agrees with the writer's natural
+    /// sort order (flatc's `CreateVectorOfSortedTables` sorts
+    /// numerically for integer keyed fields).
+    Int(i64),
+}
+
+/// Project the AST `key` onto the keyed field's natural comparison
+/// type, or short-circuit to a no-match sentinel for combinations
+/// that cannot possibly match any well-formed element.
 ///
-/// On miss / absent / empty vector, returns `vec![None]` (path
-/// short-circuits, matching `Step::Index`'s OOB behaviour).
+/// Returns:
+/// - `Ok(Some(CompiledKey::...))` for a structurally-valid lookup
+///   (string key vs. string field, int / parseable-int-text key
+///   vs. integer field).
+/// - `Ok(None)` for a structurally-impossible lookup (int key
+///   vs. string field, non-parseable text vs. integer field): the
+///   binary search short-circuits to `vec![None]` without reading
+///   any element, mirroring `key_matches`'s `Ok(false)` arm so the
+///   linear-scan and binary-search paths agree on misses.
+/// - `Err(UnsupportedType)` for a keyed field whose type this
+///   slice doesn't handle (Float / Double / Bool / nested table /
+///   vector / union / array). Same contract as `key_matches`.
+fn compile_key<'a>(
+    keyed_field: &Field,
+    key: &'a MapKey,
+) -> Result<Option<CompiledKey<'a>>, ExecuteError> {
+    let kbase = keyed_field.type_().base_type();
+    match (kbase, key) {
+        (BaseType::String, MapKey::Text(s)) => Ok(Some(CompiledKey::Text(s))),
+        (BaseType::String, MapKey::Int(_)) => Ok(None),
+        (b, MapKey::Text(s)) if is_integer_base(b) => {
+            Ok(s.parse::<i64>().ok().map(CompiledKey::Int))
+        }
+        (b, MapKey::Int(n)) if is_integer_base(b) => Ok(Some(CompiledKey::Int(*n))),
+        _ => Err(ExecuteError::UnsupportedType {
+            field: keyed_field.name().to_string(),
+            type_name: base_type_name(kbase),
+        }),
+    }
+}
+
+/// Compare an element's stringified `(key)` value (as produced by
+/// `get_any_field_string`) against the [`CompiledKey`] from
+/// [`compile_key`].
+///
+/// `Ordering::Less` means `actual < compiled` (the bisect should
+/// move *right*, lo := mid + 1); `Greater` means `actual > compiled`
+/// (move *left*, hi := mid).
+///
+/// For integer keys we first parse `actual` as `i64`. A well-formed
+/// verified buffer with an `is_integer_base` keyed field always
+/// stringifies to a value that round-trips through `parse::<i64>`,
+/// with one corner: `ULong` values above `i64::MAX` overflow. That's
+/// a known v0.1 limitation; treating the parse failure as
+/// `Ordering::Less` keeps the bisect deterministic (the affected
+/// element is sorted as if it were the smallest possible value),
+/// which only misorders entries within the `> i64::MAX` band — a
+/// band the bisect can't represent in its `i64` comparand either.
+fn compare_actual_to_compiled(actual: &str, compiled: &CompiledKey<'_>) -> Ordering {
+    match compiled {
+        CompiledKey::Text(s) => actual.cmp(*s),
+        CompiledKey::Int(n) => match actual.parse::<i64>() {
+            Ok(v) => v.cmp(n),
+            Err(_) => Ordering::Less,
+        },
+    }
+}
+
+/// `field[abc]` — find the entry whose `(key)`-annotated field
+/// equals `key`. Strategy is driven by
+/// [`ExecuteOptions::key_lookup_strict`] (Postgres-side knob:
+/// `pg_flatbuffers.key_lookup_strict`):
+///
+/// - `true` (default): binary search under the FlatBuffers `(key)`-
+///   sorted contract (matches the upstream `LookupByKey` accessor's
+///   semantics, design §7.2 step 4). O(log n) lookups, but a writer
+///   that violated the sort contract will see *silent misses* on
+///   keys whose true position is past a comparison the bisect made
+///   the wrong call on. Never a buffer over-read — the verifier
+///   already bounds reads to vetted memory.
+/// - `false`: linear scan, first match in wire order. Correct on
+///   any vector regardless of sortedness, at O(n) per lookup
+///   (design §10 escape hatch).
+///
+/// On miss / absent / empty vector / structurally-impossible key
+/// shape (e.g. `[42]` against a string-keyed field), returns
+/// `vec![None]` — same short-circuit as `Step::Index` OOB and
+/// `key_matches`'s linear-scan no-match path.
 fn walk_vector_at_map_key(
     table: &Table,
     field: &Field,
@@ -907,6 +1009,43 @@ fn walk_vector_at_map_key(
         None => return Ok(vec![None]),
     };
 
+    if options.key_lookup_strict {
+        // Binary search under the FlatBuffers (key)-sorted contract.
+        // `compile_key` projects the AST `MapKey` to the keyed
+        // field's natural comparison type once up front; a
+        // structurally-impossible key (e.g. `[42]` against a string
+        // field, or `[abc]` against an int field) compiles to
+        // `None`, which short-circuits to the no-match sentinel
+        // before any element is read. Returning `Err` on a
+        // genuinely-unsupported keyed field type (Float / Double /
+        // Bool / ...) preserves the existing `key_matches` contract.
+        let compiled = match compile_key(&keyed_field, key)? {
+            Some(c) => c,
+            None => return Ok(vec![None]),
+        };
+
+        let mut lo = 0usize;
+        let mut hi = vec.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let elem = vec.get(mid);
+            // SAFETY: see `key_matches`. The keyed field came from
+            // the schema's reflected `Object.fields()`, and the
+            // buffer was verified.
+            let actual = unsafe { get_any_field_string(&elem, &keyed_field, schema) };
+            match compare_actual_to_compiled(&actual, &compiled) {
+                Ordering::Equal => {
+                    return walk_table(&elem, &child_object, schema, tail, options);
+                }
+                Ordering::Less => lo = mid + 1,
+                Ordering::Greater => hi = mid,
+            }
+        }
+        return Ok(vec![None]);
+    }
+
+    // key_lookup_strict = off: linear scan that's correct on any
+    // vector regardless of sortedness.
     for elem in vec.iter() {
         if key_matches(&elem, &keyed_field, schema, key)? {
             return walk_table(&elem, &child_object, schema, tail, options);
@@ -1851,6 +1990,50 @@ mod tests {
         Object as RObject, ObjectArgs, Schema as RSchema, SchemaArgs, Type, TypeArgs,
     };
 
+    // -- comparator unit tests (pure; no fixture) --
+
+    #[test]
+    fn compare_text_keys_lexicographically() {
+        let key = CompiledKey::Text("banana");
+        assert_eq!(compare_actual_to_compiled("apple", &key), Ordering::Less);
+        assert_eq!(compare_actual_to_compiled("banana", &key), Ordering::Equal);
+        assert_eq!(
+            compare_actual_to_compiled("cherry", &key),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn compare_int_keys_numerically() {
+        // Lexicographic comparison would put "10" < "2"; numeric
+        // comparison puts 2 < 10. Pin the numeric semantics.
+        let key = CompiledKey::Int(10);
+        assert_eq!(compare_actual_to_compiled("2", &key), Ordering::Less);
+        assert_eq!(compare_actual_to_compiled("10", &key), Ordering::Equal);
+        assert_eq!(compare_actual_to_compiled("11", &key), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_int_keys_signed() {
+        // Negative actuals (signed int fields) parse and compare
+        // correctly without underflowing through "-" lexicography.
+        let key = CompiledKey::Int(0);
+        assert_eq!(compare_actual_to_compiled("-5", &key), Ordering::Less);
+        assert_eq!(compare_actual_to_compiled("5", &key), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_int_keys_unparseable_actual_is_less() {
+        // Documented in `compare_actual_to_compiled`: a
+        // non-i64-parseable actual (e.g., a ULong above i64::MAX)
+        // sorts as `Less` so the bisect remains deterministic.
+        let key = CompiledKey::Int(42);
+        assert_eq!(
+            compare_actual_to_compiled("99999999999999999999", &key),
+            Ordering::Less,
+        );
+    }
+
     // -- fixtures --
 
     /// Build a two-table schema:
@@ -2104,6 +2287,7 @@ mod tests {
         let query = parse("Order:id").expect("test query parses");
         let options = ExecuteOptions {
             fill_scalar_defaults: false,
+            ..ExecuteOptions::default()
         };
         let leaves = execute_with_options(&buf, &schema, &query, &Bounds::default(), &options)
             .expect("execute succeeds");
@@ -2136,6 +2320,7 @@ mod tests {
         let query = parse("Order:id").expect("test query parses");
         let options = ExecuteOptions {
             fill_scalar_defaults: false,
+            ..ExecuteOptions::default()
         };
         let leaves = execute_with_options(&buf, &schema, &query, &Bounds::default(), &options)
             .expect("execute succeeds");
@@ -2880,6 +3065,21 @@ mod tests {
         run_vec_all(query_str, buf, bfbs).map(|v| v.into_iter().next().flatten())
     }
 
+    /// Like [`run_vec`] but takes a custom [`ExecuteOptions`] so
+    /// tests can pin the `key_lookup_strict` mode (binary search
+    /// vs. linear scan) explicitly.
+    fn run_vec_with(
+        query_str: &str,
+        buf: &[u8],
+        bfbs: &[u8],
+        options: &ExecuteOptions,
+    ) -> Result<Option<String>, ExecuteError> {
+        let schema = root_as_schema(bfbs).expect("test schema verifies");
+        let query = parse(query_str).expect("test query parses");
+        execute_with_options(buf, &schema, &query, &Bounds::default(), options)
+            .map(|v| v.into_iter().next().flatten())
+    }
+
     fn run_vec_all(
         query_str: &str,
         buf: &[u8],
@@ -3164,12 +3364,23 @@ mod tests {
     #[test]
     fn vector_map_key_first_hit_in_wire_order() {
         let bfbs = build_vec_schema();
-        // Two entries with sku = "dup": linear scan returns the
-        // first in wire order (matching the §10
-        // `key_lookup_strict = off` fallback semantics that this
-        // slice ships unconditionally).
+        // Two entries with sku = "dup": the linear-scan path
+        // (`key_lookup_strict = off`) returns the first in wire
+        // order. Binary search under the default
+        // `key_lookup_strict = on` mode can return *either* match
+        // depending on the bisect path, so we pin the wire-order
+        // tiebreaker against the off-path explicitly.
         let buf = build_bag(Some(&["dup", "x", "dup"]), None, None, None);
-        let v = run_vec("Bag:items[dup].sku", &buf, &bfbs).expect("ok");
+        let v = run_vec_with(
+            "Bag:items[dup].sku",
+            &buf,
+            &bfbs,
+            &ExecuteOptions {
+                key_lookup_strict: false,
+                ..ExecuteOptions::default()
+            },
+        )
+        .expect("ok");
         assert_eq!(v.as_deref(), Some("dup"));
     }
 
@@ -3196,6 +3407,131 @@ mod tests {
         let buf = build_bag(None, None, None, None);
         let v = run_vec("Bag:items[abc].sku", &buf, &bfbs).expect("ok");
         assert!(v.is_none(), "got {v:?}");
+    }
+
+    // -- Step::MapKey: binary search vs. linear scan --
+
+    /// Binary search (the `key_lookup_strict = on` default) finds an
+    /// interior key on a properly sorted vector. With 5 elements
+    /// the bisect visits ~3 of them, vs. ~3 on average for linear
+    /// scan; the perf-win story shows up at larger n, but this
+    /// fixture is enough to pin correctness.
+    #[test]
+    fn vector_map_key_binary_search_interior_hit() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["a", "b", "c", "d", "e"]), None, None, None);
+        let v = run_vec("Bag:items[c].sku", &buf, &bfbs).expect("ok");
+        assert_eq!(v.as_deref(), Some("c"));
+    }
+
+    /// Binary search must hit both endpoints (lo-mid and hi-mid
+    /// boundaries). The interior-hit test alone doesn't exercise
+    /// either edge.
+    #[test]
+    fn vector_map_key_binary_search_first_and_last_hit() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["a", "b", "c", "d", "e"]), None, None, None);
+        let first = run_vec("Bag:items[a].sku", &buf, &bfbs).expect("ok");
+        assert_eq!(first.as_deref(), Some("a"));
+        let last = run_vec("Bag:items[e].sku", &buf, &bfbs).expect("ok");
+        assert_eq!(last.as_deref(), Some("e"));
+    }
+
+    /// Binary search reports miss on a key sandwiched between two
+    /// present keys (the classic "split goes both ways" case where
+    /// a naive bisect would loop forever if it didn't tighten the
+    /// half-open range correctly).
+    #[test]
+    fn vector_map_key_binary_search_interior_miss() {
+        let bfbs = build_vec_schema();
+        // "bb" sorts between "b" and "c"; not present.
+        let buf = build_bag(Some(&["a", "b", "c", "d"]), None, None, None);
+        let v = run_vec("Bag:items[bb].sku", &buf, &bfbs).expect("ok");
+        assert!(v.is_none(), "got {v:?}");
+    }
+
+    /// Binary search misses below the first element (lo advances
+    /// past hi at lo=0,hi=0 immediately).
+    #[test]
+    fn vector_map_key_binary_search_below_first_miss() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["m", "n", "o"]), None, None, None);
+        let v = run_vec("Bag:items[a].sku", &buf, &bfbs).expect("ok");
+        assert!(v.is_none(), "got {v:?}");
+    }
+
+    /// Binary search misses above the last element.
+    #[test]
+    fn vector_map_key_binary_search_above_last_miss() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["a", "b", "c"]), None, None, None);
+        let v = run_vec("Bag:items[z].sku", &buf, &bfbs).expect("ok");
+        assert!(v.is_none(), "got {v:?}");
+    }
+
+    /// `key_lookup_strict = on` against an unsorted vector silently
+    /// misses keys the bisect can't reach. This is the documented
+    /// worst case from the GUC's doc text — fail-fast for the
+    /// operator is escalate to `key_lookup_strict = off`. Pin it so
+    /// a regression that accidentally fell back to linear scan
+    /// under strict-on would surface.
+    #[test]
+    fn vector_map_key_binary_search_unsorted_silent_miss() {
+        let bfbs = build_vec_schema();
+        // "a" sorts before "b" / "c", but the vector is in reverse
+        // order. Bisect on len=3 visits mid=1 first; sees "b" vs.
+        // target "a" → Less → moves to hi=1; then mid=0, sees "c"
+        // vs. "a" → Greater → hi=0; loop ends; no match.
+        let buf = build_bag(Some(&["c", "b", "a"]), None, None, None);
+        let v = run_vec("Bag:items[a].sku", &buf, &bfbs).expect("ok");
+        assert!(
+            v.is_none(),
+            "binary search on unsorted vec must silently miss; got {v:?}",
+        );
+    }
+
+    /// Same fixture as the strict-on silent-miss test, but with
+    /// `key_lookup_strict = off`: linear scan finds the element
+    /// regardless of order. Pins the escape-hatch contract.
+    #[test]
+    fn vector_map_key_linear_scan_finds_unsorted_match() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["c", "b", "a"]), None, None, None);
+        let v = run_vec_with(
+            "Bag:items[a].sku",
+            &buf,
+            &bfbs,
+            &ExecuteOptions {
+                key_lookup_strict: false,
+                ..ExecuteOptions::default()
+            },
+        )
+        .expect("ok");
+        assert_eq!(v.as_deref(), Some("a"));
+    }
+
+    /// Both modes agree on miss when the key genuinely isn't
+    /// present, regardless of sortedness. Belt-and-suspenders for
+    /// the "off mode doesn't silently invent matches" property.
+    #[test]
+    fn vector_map_key_both_modes_agree_on_absent_key() {
+        let bfbs = build_vec_schema();
+        let buf = build_bag(Some(&["a", "b", "c"]), None, None, None);
+        let strict = run_vec("Bag:items[zzz].sku", &buf, &bfbs).expect("ok");
+        let loose = run_vec_with(
+            "Bag:items[zzz].sku",
+            &buf,
+            &bfbs,
+            &ExecuteOptions {
+                key_lookup_strict: false,
+                ..ExecuteOptions::default()
+            },
+        )
+        .expect("ok");
+        assert!(
+            strict.is_none() && loose.is_none(),
+            "{strict:?} vs {loose:?}"
+        );
     }
 
     #[test]
