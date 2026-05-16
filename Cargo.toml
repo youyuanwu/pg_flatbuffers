@@ -2,7 +2,7 @@
 #
 # Member crates live in crates/. Shared dependency versions are hoisted
 # into [workspace.dependencies] so member manifests can `workspace = true`.
-# See docs/design.md §5 for the layout rationale.
+# See docs/design/overview.md ("Module layout") for the layout rationale.
 
 [workspace]
 members  = ["crates/*"]

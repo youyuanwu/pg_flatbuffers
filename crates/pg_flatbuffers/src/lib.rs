@@ -1,10 +1,10 @@
 //! pg_flatbuffers — Postgres extension for querying and converting
 //! FlatBuffers payloads stored in `bytea` columns.
 //!
-//! v0.1 surface (this slice): version function + `flatbuffers_schemas`
-//! catalog with `flatbuffers_validate_schema`. Subsequent slices add
-//! the schema cache, query parser/executor, and JSON conversion per
-//! `docs/design.md`.
+//! v0.1 surface: version function + `flatbuffers_schemas` catalog with
+//! `flatbuffers_validate_schema`, plus the schema cache, query parser/
+//! executor, and JSON conversion. See `docs/design/README.md` for the
+//! topic index.
 
 use pgrx::prelude::*;
 
@@ -49,7 +49,7 @@ pub extern "C-unwind" fn _PG_init() {
 ///
 /// Sourced from `Cargo.toml` at compile time, so bumping the package
 /// version automatically bumps this. Wire-compatible with the
-/// `flatbuffers_extension_version()` contract in `docs/design.md` §4.2.
+/// `flatbuffers_extension_version()` contract in `docs/design/sql-surface.md`.
 #[pg_extern(immutable, parallel_safe)]
 fn flatbuffers_extension_version() -> i32 {
     const MAJOR: i32 = parse_u16(env!("CARGO_PKG_VERSION_MAJOR")) as i32;

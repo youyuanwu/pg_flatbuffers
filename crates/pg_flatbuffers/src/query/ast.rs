@@ -1,8 +1,9 @@
 //! AST for the `pg_flatbuffers` query mini-language.
 //!
-//! See `docs/design.md` §4.3 (query language) and §7.1 (parse). The
-//! grammar is small enough that a hand-written recursive-descent
-//! parser (`super::parser`) is sufficient.
+//! See `docs/design/sql-surface.md` (query language) and
+//! `docs/design/query-execution.md` (parse). The grammar is small enough
+//! that a hand-written recursive-descent parser (`super::parser`) is
+//! sufficient.
 //!
 //! Strings inside the AST are owned (`String`) rather than borrowed
 //! from the input. Parsing happens once per executor call and the
@@ -29,7 +30,7 @@ pub struct Query {
     pub steps: Vec<Step>,
 }
 
-/// One step in a path. See `docs/design.md` §4.3 for semantics.
+/// One step in a path. See `docs/design/sql-surface.md` for semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     /// `field` or `submessage.field` (one segment per `Step::Field`)

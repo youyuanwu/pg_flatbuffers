@@ -1,7 +1,8 @@
 //! Hand-written recursive-descent parser for the
 //! `[<schema>:]<table>:<path>` query mini-language.
 //!
-//! See `docs/design.md` §4.3 (language) and §7.1 (parse). The grammar
+//! See `docs/design/sql-surface.md` (language) and
+//! `docs/design/query-execution.md` (parse). The grammar
 //! is small enough that a parser-combinator dependency would be
 //! overkill; this module stays pure Rust with no `pgrx` dependencies
 //! so it is unit-testable without a Postgres backend.
@@ -25,13 +26,13 @@
 
 use super::ast::{FieldRef, MapKey, ParseError, ParseErrorKind, Query, Step};
 
-/// Default cap matching `docs/design.md` §10
+/// Default cap matching `docs/design/safety.md`
 /// (`pg_flatbuffers.max_query_length`). Callers from inside the
 /// extension thread the GUC value here; pure-Rust callers (tests,
 /// fuzzing) typically use [`parse`] which uses the defaults.
 pub const DEFAULT_MAX_QUERY_LENGTH: usize = 4096;
 
-/// Default cap matching `docs/design.md` §10
+/// Default cap matching `docs/design/safety.md`
 /// (`pg_flatbuffers.max_path_depth`). One unit of depth = one path
 /// step (field, index, all, map-key, map-keys, or union-type).
 pub const DEFAULT_MAX_PATH_DEPTH: usize = 256;

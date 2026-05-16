@@ -1,6 +1,6 @@
 //! Bounded reflection-driven FlatBuffers verifier.
 //!
-//! See `docs/design.md` §10 ("Safety / untrusted input"). Every read
+//! See `docs/design/safety.md`. Every read
 //! path that touches caller-supplied bytes — `flatbuffers_query*`,
 //! `flatbuffers_to_json*`, the `CHECK` constraint behind
 //! `flatbuffers_verify` — funnels through [`verify`] first so a
@@ -63,7 +63,7 @@ use flatbuffers_reflection::{FlatbufferError, SafeBuffer};
 use thiserror::Error;
 
 /// Verifier resource bounds. Map 1:1 to the `pg_flatbuffers.max_*`
-/// GUCs in `docs/design.md` §10. Every field is `usize` to match
+/// GUCs in `docs/design/safety.md`. Every field is `usize` to match
 /// [`flatbuffers::VerifierOptions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bounds {

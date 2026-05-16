@@ -1,5 +1,5 @@
 //! SQL-exposed query / verify / introspection functions
-//! (see `docs/design.md` §4.2).
+//! (see `docs/design/sql-surface.md`).
 //!
 //! This module is the thin pgrx layer that turns SQL calls into the
 //! pure-Rust building blocks already in place:
@@ -49,7 +49,7 @@
 //!   it once usage shows it matters.
 
 /// Schema name used when a query string omits the `schema:` prefix.
-/// Matches `docs/design.md` §4.3.
+/// Matches `docs/design/sql-surface.md`.
 pub(super) const DEFAULT_SCHEMA: &str = "default";
 
 mod from_json;

@@ -1,6 +1,6 @@
 //! Per-backend schema cache for `flatbuffers_schemas`.
 //!
-//! See `docs/design.md` §6. The cache is the integration point between
+//! See `docs/design/schema-cache.md`. The cache is the integration point between
 //! the catalog (registered, verified `.bfbs` blobs) and the executor
 //! (zero-copy `reflection::Schema` views needed per query).
 //!

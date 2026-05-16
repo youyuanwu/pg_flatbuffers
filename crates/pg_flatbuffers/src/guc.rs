@@ -1,5 +1,5 @@
 //! GUC (Grand Unified Configuration) plumbing for the verifier bounds
-//! (see `docs/design.md` §10).
+//! (see `docs/design/safety.md`).
 //!
 //! ## Scope of this slice
 //!

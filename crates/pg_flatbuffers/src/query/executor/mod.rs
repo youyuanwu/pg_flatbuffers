@@ -1,4 +1,4 @@
-//! Reflection-driven query executor (see `docs/design.md` §7.2).
+//! Reflection-driven query executor (see `docs/design/query-execution.md`).
 //!
 //! Consumes a parsed [`Query`] plus a registered [`Schema`] and a
 //! caller-supplied buffer, and produces a list of leaves as
@@ -163,7 +163,7 @@ pub enum ExecuteError {
     /// *query-shape* limitations.
     #[error(
         "field {field:?} has type {type_name}; the v0.1 executor handles only \
-         scalar/string leaves and nested tables (see docs/design.md §15)"
+         scalar/string leaves and nested tables (see docs/design/roadmap.md)"
     )]
     UnsupportedType {
         field: String,
@@ -176,7 +176,7 @@ pub enum ExecuteError {
     /// message rather than silently truncating the path.
     #[error(
         "path step `{what}` is not yet implemented in the v0.1 executor \
-         (see docs/design.md §15)"
+         (see docs/design/roadmap.md)"
     )]
     UnsupportedStep { what: &'static str },
 
@@ -198,7 +198,7 @@ pub enum ExecuteError {
 ///   result has length N (or 0 if the vector is absent / empty).
 ///
 /// `bounds` plumbs the per-call resource limits from
-/// `docs/design.md` §10. `options` carries the per-call read-side
+/// `docs/design/safety.md`. `options` carries the per-call read-side
 /// knobs ([`ExecuteOptions`]). Postgres entry points source both
 /// from the GUC layer (see [`crate::guc::current_bounds`] and
 /// [`crate::guc::current_fill_scalar_defaults`]); pure-Rust tests

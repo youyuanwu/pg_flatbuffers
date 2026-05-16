@@ -1,4 +1,4 @@
--- pg_flatbuffers catalog (docs/design.md §4.1)
+-- pg_flatbuffers catalog (docs/design/catalog-and-schemas.md)
 --
 -- Creates:
 --   * the `flatbuffers_admin` role (cluster-wide; idempotent)
@@ -21,7 +21,7 @@ END$$;
 -- The catalog itself. `bfbs` carries the binary reflection schema
 -- (output of `flatc -b --schema`); the CHECK runs the FlatBuffers
 -- verifier so a malformed blob never lands in the table (let alone
--- the schema cache; see docs/design.md §6).
+-- the schema cache; see docs/design/schema-cache.md).
 CREATE TABLE @extschema@.flatbuffers_schemas (
     name             text         PRIMARY KEY,
     bfbs             bytea        NOT NULL,

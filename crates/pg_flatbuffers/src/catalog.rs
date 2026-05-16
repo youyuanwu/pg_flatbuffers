@@ -1,9 +1,10 @@
 //! Catalog functions for `flatbuffers_schemas`.
 //!
-//! See `docs/design.md` §4.1, §4.2, and §10. The catalog table itself
-//! and its grants are emitted by `sql/catalog.sql`; this module hosts
-//! the Rust-side functions referenced by that SQL (notably the CHECK
-//! constraint on the `bfbs` column).
+//! See `docs/design/catalog-and-schemas.md`, `docs/design/sql-surface.md`,
+//! and `docs/design/safety.md`. The catalog table itself and its grants are
+//! emitted by `sql/catalog.sql`; this module hosts the Rust-side functions
+//! referenced by that SQL (notably the CHECK constraint on the `bfbs`
+//! column).
 
 use pgrx::prelude::*;
 
@@ -15,7 +16,7 @@ use pgrx::prelude::*;
 ///
 /// - The `CHECK (flatbuffers_validate_schema(bfbs))`-style guard on
 ///   `flatbuffers_schemas.bfbs` (so a bad blob never reaches the
-///   cache; see `docs/design.md` §4.1).
+///   cache; see `docs/design/catalog-and-schemas.md`).
 /// - Operators wishing to validate before INSERT.
 ///
 /// # Soundness

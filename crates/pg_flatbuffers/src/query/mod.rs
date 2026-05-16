@@ -5,7 +5,8 @@
 //! (`cargo test` is enough; `cargo pgrx test` is not required for
 //! anything in this directory).
 //!
-//! See `docs/design.md` §4.3 (language) and §7.1 (parse).
+//! See `docs/design/sql-surface.md` (language) and
+//! `docs/design/query-execution.md` (parse).
 
 pub mod ast;
 pub mod executor;

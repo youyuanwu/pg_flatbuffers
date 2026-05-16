@@ -11,8 +11,9 @@ authors.workspace      = true
 [lib]
 crate-type = ["cdylib"]
 
-# v0.1 ships PG 18 only (see docs/design.md §11). PG 17 is a v0.2 target.
-# Older majors (pg13–pg16) are intentionally absent from the feature set.
+# v0.1 ships PG 18 only (see docs/design/compatibility-build-test.md).
+# PG 17 is a v0.2 target; older majors (pg13–pg16) are intentionally absent
+# from the feature set.
 [features]
 default  = ["pg18"]
 pg17     = ["pgrx/pg17", "pgrx-tests/pg17"]
