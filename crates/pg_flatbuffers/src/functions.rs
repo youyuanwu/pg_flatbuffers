@@ -29,10 +29,11 @@
 //! - `flatbuffers_to_json{,_text}` and
 //!   `flatbuffers_from_json{,_text}` — live in a future
 //!   `json.rs` slice.
-//! - GUC plumbing for [`crate::verify::Bounds`]: today every call
-//!   uses [`crate::verify::Bounds::default`]. The GUC slice will
-//!   read `pg_flatbuffers.max_depth` / `max_tables` /
-//!   `max_apparent_size_mb` and pass an explicit `Bounds` here.
+//! - GUC plumbing for [`crate::verify::Bounds`]: each entry point
+//!   calls [`crate::guc::current_bounds`], which materialises a
+//!   [`crate::verify::Bounds`] from the three `SUSET` GUCs
+//!   (`pg_flatbuffers.max_depth`, `max_tables`,
+//!   `max_apparent_size_mb`). Registration lives in [`crate::guc::init`].
 //! - The `pg_flatbuffers.strict` GUC, which would let
 //!   [`flatbuffers_query`] return `NULL` instead of `ERROR` on a
 //!   structural verifier failure (§10 "strict does not relax
@@ -41,9 +42,10 @@
 //!   query invocations share a buffer in one statement; we'll add
 //!   it once usage shows it matters.
 
+use crate::guc::current_bounds;
 use crate::query::{execute, parse};
 use crate::schema_cache::lookup_schema;
-use crate::verify::{verify, Bounds};
+use crate::verify::verify;
 use pgrx::iter::SetOfIterator;
 use pgrx::prelude::*;
 
@@ -88,7 +90,7 @@ fn flatbuffers_query(query: &str, buf: &[u8]) -> Option<String> {
     let cached = lookup_schema(schema_name);
     let schema_view = cached.schema();
 
-    let leaves = match execute(buf, &schema_view, &parsed, &Bounds::default()) {
+    let leaves = match execute(buf, &schema_view, &parsed, &current_bounds()) {
         Ok(v) => v,
         Err(e) => error!("flatbuffers_query: {e}"),
     };
@@ -130,7 +132,7 @@ fn flatbuffers_query_array(query: &str, buf: &[u8]) -> Vec<String> {
     let cached = lookup_schema(schema_name);
     let schema_view = cached.schema();
 
-    match execute(buf, &schema_view, &parsed, &Bounds::default()) {
+    match execute(buf, &schema_view, &parsed, &current_bounds()) {
         Ok(v) => v.into_iter().flatten().collect(),
         Err(e) => error!("flatbuffers_query_array: {e}"),
     }
@@ -172,7 +174,7 @@ fn flatbuffers_query_multi(query: &str, buf: &[u8]) -> SetOfIterator<'static, St
     let cached = lookup_schema(schema_name);
     let schema_view = cached.schema();
 
-    let leaves = match execute(buf, &schema_view, &parsed, &Bounds::default()) {
+    let leaves = match execute(buf, &schema_view, &parsed, &current_bounds()) {
         Ok(v) => v,
         Err(e) => error!("flatbuffers_query_multi: {e}"),
     };
@@ -223,7 +225,7 @@ fn flatbuffers_verify(table_name: &str, buf: &[u8]) -> bool {
         return false;
     }
 
-    verify(buf, &cached.schema(), &Bounds::default()).is_ok()
+    verify(buf, &cached.schema(), &current_bounds()).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1891,5 +1893,45 @@ mod tests {
     #[pg_test(error = "flatbuffers schema \"missing\" is not registered")]
     fn pg_root_type_unknown_schema_errors() {
         Spi::get_one::<String>("SELECT flatbuffers_root_type('missing')").expect("SPI failure");
+    }
+
+    // -- GUC plumbing (design §10) --
+
+    /// End-to-end smoke that `SET pg_flatbuffers.max_tables` actually
+    /// reaches the verifier on a subsequent SQL call. A `Catalog`
+    /// with one `Entry` exposes two tables to the verifier, so a
+    /// `max_tables = 1` cap rejects the payload — surfaced through
+    /// `flatbuffers_verify`'s boolean contract as `false` (the
+    /// function never raises on a buffer-level failure, per
+    /// `flatbuffers_verify`'s docstring). The GUC's own
+    /// SET / SHOW / range-guard coverage lives in `guc.rs`.
+    #[pg_test]
+    fn pg_guc_max_tables_plumbs_to_verifier() {
+        register("default", "Catalog", build_catalog_schema_bfbs());
+        let buf = build_catalog_buf(&["alpha"]);
+
+        // Baseline: default `max_tables = 1_000_000` accepts the
+        // 2-table buffer.
+        let baseline = Spi::get_one_with_args::<bool>(
+            "SELECT flatbuffers_verify('Catalog', $1)",
+            &[buf.clone().into()],
+        )
+        .expect("SPI failure")
+        .expect("NULL from happy path");
+        assert!(baseline, "baseline verify must accept");
+
+        // Constrained: `max_tables = 1` is below the buffer's
+        // 2-table requirement, so the verifier rejects.
+        Spi::run("SET pg_flatbuffers.max_tables = 1").expect("SPI: SET max_tables");
+        let constrained = Spi::get_one_with_args::<bool>(
+            "SELECT flatbuffers_verify('Catalog', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure")
+        .expect("NULL from constrained path");
+        assert!(
+            !constrained,
+            "max_tables = 1 must reject a 2-table Catalog buffer",
+        );
     }
 }

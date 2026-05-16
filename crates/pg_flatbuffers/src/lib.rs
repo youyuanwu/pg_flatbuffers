@@ -12,6 +12,7 @@ use pgrx::prelude::*;
 
 mod catalog;
 mod functions;
+mod guc;
 mod query;
 mod schema_cache;
 mod verify;
@@ -29,7 +30,8 @@ extension_sql_file!(
 
 /// Postgres calls this once per backend when it loads the extension's
 /// shared library. We use it to register the schema-cache invalidation
-/// callback so every backend sees catalog updates committed elsewhere.
+/// callback so every backend sees catalog updates committed elsewhere,
+/// and to register the `pg_flatbuffers.max_*` GUCs (see `guc.rs`).
 ///
 /// Must be `#[pg_guard]`'d so that any panic / `ereport(ERROR)` inside
 /// initialization is converted to a Postgres ERROR rather than
@@ -37,6 +39,7 @@ extension_sql_file!(
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     schema_cache::init();
+    guc::init();
 }
 
 /// Returns the extension version as a packed integer:

@@ -44,11 +44,6 @@
 //!   memory-context reset, which only makes sense once the executor
 //!   exists to call us many times per statement. Adding `blake3`
 //!   speculatively would be cargo-cult dependency growth.
-//! - **GUC wiring** for [`Bounds`]. For now [`Bounds::default`]
-//!   matches the design defaults (`max_depth=64`,
-//!   `max_tables=1_000_000`, `max_apparent_size=64 MiB`). When the
-//!   GUC slice lands, callers will read each GUC and pass an explicit
-//!   [`Bounds`] instead of `default()`.
 
 use flatbuffers::VerifierOptions;
 use flatbuffers_reflection::reflection::Schema;
