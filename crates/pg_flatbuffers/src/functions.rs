@@ -896,6 +896,219 @@ mod tests {
         fbb.finished_data().to_vec()
     }
 
+    /// Build a fixed-size-array schema for the SQL-side smoke.
+    /// Mirror of the executor's `build_holder_schema` fixture:
+    ///
+    /// ```text
+    /// struct Vec3   { x:float; y:float; z:float; }   // 12 bytes, align 4
+    /// struct Bundle {
+    ///   xs:  [float:3];   // offset 0,  size 12 (scalar elements)
+    ///   pts: [Vec3:2];    // offset 12, size 24 (struct elements)
+    /// }                                              // bytesize 36
+    /// table Holder { b:Bundle; }
+    /// ```
+    ///
+    /// Object ordering: Bundle (0), Holder (1), Vec3 (2).
+    fn build_holder_schema_bfbs() -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        use flatbuffers_reflection::reflection::{
+            BaseType, Enum, Field as RField, FieldArgs, Object as RObject, ObjectArgs,
+            Schema as RSchema, SchemaArgs, Type, TypeArgs,
+        };
+        let mut fbb = FlatBufferBuilder::new();
+
+        let float_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Float,
+                ..Default::default()
+            },
+        );
+
+        // -- struct Vec3 --
+        let vx_n = fbb.create_string("x");
+        let vx = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(vx_n),
+                type_: Some(float_t),
+                id: 0,
+                offset: 0,
+                ..Default::default()
+            },
+        );
+        let vy_n = fbb.create_string("y");
+        let vy = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(vy_n),
+                type_: Some(float_t),
+                id: 1,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let vz_n = fbb.create_string("z");
+        let vz = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(vz_n),
+                type_: Some(float_t),
+                id: 2,
+                offset: 8,
+                ..Default::default()
+            },
+        );
+        let vec3_fields = fbb.create_vector(&[vx, vy, vz]);
+        let vec3_n = fbb.create_string("Vec3");
+        let vec3 = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(vec3_n),
+                fields: Some(vec3_fields),
+                is_struct: true,
+                bytesize: 12,
+                minalign: 4,
+                ..Default::default()
+            },
+        );
+
+        // -- struct Bundle { xs:[float:3] @0; pts:[Vec3:2] @12; } --
+        // Vec3 sorts as object index 2.
+        let xs_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Array,
+                element: BaseType::Float,
+                fixed_length: 3,
+                ..Default::default()
+            },
+        );
+        let pts_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Array,
+                element: BaseType::Obj,
+                index: 2,
+                fixed_length: 2,
+                ..Default::default()
+            },
+        );
+        let pts_n = fbb.create_string("pts");
+        let pts_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(pts_n),
+                type_: Some(pts_t),
+                id: 1,
+                offset: 12,
+                ..Default::default()
+            },
+        );
+        let xs_n = fbb.create_string("xs");
+        let xs_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(xs_n),
+                type_: Some(xs_t),
+                id: 0,
+                offset: 0,
+                ..Default::default()
+            },
+        );
+        // Field vector sorted alphabetically: pts (p) < xs (x).
+        let bundle_fields = fbb.create_vector(&[pts_f, xs_f]);
+        let bundle_n = fbb.create_string("Bundle");
+        let bundle = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(bundle_n),
+                fields: Some(bundle_fields),
+                is_struct: true,
+                bytesize: 36,
+                minalign: 4,
+                ..Default::default()
+            },
+        );
+
+        // -- table Holder { b: Bundle } --
+        // Bundle sorts as object index 0.
+        let bundle_obj_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Obj,
+                index: 0,
+                ..Default::default()
+            },
+        );
+        let b_n = fbb.create_string("b");
+        let b_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(b_n),
+                type_: Some(bundle_obj_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let holder_fields = fbb.create_vector(&[b_f]);
+        let holder_n = fbb.create_string("Holder");
+        let holder = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(holder_n),
+                fields: Some(holder_fields),
+                ..Default::default()
+            },
+        );
+
+        let objects = fbb.create_vector(&[bundle, holder, vec3]);
+        let enums = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum>>(&[]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(holder),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// Mirror of the `Bundle` struct above.
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    struct TestBundle {
+        xs: [f32; 3],
+        pts: [TestVec3; 2],
+    }
+
+    // SAFETY: see [`TestVec3`].
+    impl flatbuffers::Push for TestBundle {
+        type Output = TestBundle;
+        unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+            let src = std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            );
+            dst[..src.len()].copy_from_slice(src);
+        }
+    }
+
+    /// Build a `Holder` buffer containing the supplied `Bundle`.
+    fn build_holder_buf(b: TestBundle) -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        let mut fbb = FlatBufferBuilder::new();
+        let t = fbb.start_table();
+        fbb.push_slot_always(4, b); // slot 4 = b (inline struct)
+        let h = fbb.end_table(t);
+        fbb.finish_minimal(h);
+        fbb.finished_data().to_vec()
+    }
+
     /// Build a tiny union schema for the SQL-side smoke. Same shape
     /// as the executor's `build_union_schema` fixture (table A with
     /// `name:string`, table B with `count:int`, union U over both,
@@ -1482,6 +1695,40 @@ mod tests {
         )
         .expect("SPI failure");
         assert_eq!(v.as_deref(), Some("5"));
+    }
+
+    // -- fixed-size arrays inside structs (design §7.2 / §4.3) --
+
+    /// SQL-side smoke for `walk_array`: descend into a fixed-size
+    /// array of inline struct elements and stringify a scalar leaf.
+    /// Full unit coverage of scalar-element arrays, `[*]` fanout,
+    /// OOB / absent handling, and step-shape rejection lives in the
+    /// executor module.
+    #[pg_test]
+    fn pg_query_array_of_struct_index_field() {
+        register("default", "Holder", build_holder_schema_bfbs());
+        let buf = build_holder_buf(TestBundle {
+            xs: [1.0, 2.0, 3.0],
+            pts: [
+                TestVec3 {
+                    x: 10.0,
+                    y: 20.0,
+                    z: 30.0,
+                },
+                TestVec3 {
+                    x: 100.0,
+                    y: 200.0,
+                    z: 300.0,
+                },
+            ],
+        });
+        // Element 1 of the struct array is {100, 200, 300} — read y.
+        let v = Spi::get_one_with_args::<String>(
+            "SELECT flatbuffers_query('Holder:b.pts[1].y', $1)",
+            &[buf.into()],
+        )
+        .expect("SPI failure");
+        assert_eq!(v.as_deref(), Some("200"));
     }
 
     // -- flatbuffers_query_multi --

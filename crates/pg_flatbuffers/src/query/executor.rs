@@ -29,9 +29,10 @@
 //!   `Object` is **not** a struct).
 //! - Descent into structs (`BaseType::Obj` where the referenced
 //!   `Object` **is** a struct — inline fixed-size record).
-//!   Supports nested-struct fields and scalar leaves; rejects any
-//!   non-`Field` step (structs hold no vectors, only scalars,
-//!   nested structs, and — deferred — fixed-size arrays).
+//!   Supports nested-struct fields, scalar leaves, and fixed-size
+//!   arrays ([`BaseType::Array`], see below); rejects any non-`Field`
+//!   step (structs hold no vectors, only scalars, nested structs,
+//!   and fixed-size arrays).
 //! - Union dispatch (`BaseType::Union`, design §4.3). Reads the
 //!   `u8` discriminator from the vtable slot immediately preceding
 //!   the union value (flatc convention: discriminator at slot N-2,
@@ -66,14 +67,18 @@
 //!   element of a `(key)`-annotated vector (§7.2 step 5). Like
 //!   `[*]` but constrained to the keyed field; tail must be empty
 //!   because the keys themselves are the leaves.
+//! - Fixed-size arrays inside structs (`BaseType::Array`). Both
+//!   `[i]` indexed access and `[*]` fanout descend through the N
+//!   inline elements; element stride is the scalar size for scalar
+//!   elements and the struct's `bytesize()` for struct elements.
+//!   OOB index short-circuits to a `None` leaf (matches the vector
+//!   arms). Struct-typed elements descend via [`walk_struct`].
 //! - Stringification of scalar (int/uint/float/bool) and string leaves
 //!   via [`flatbuffers_reflection::get_any_field_string`].
 //!
 //! Deliberately deferred to dedicated micro-slices, each returning a
 //! clear [`ExecuteError::Unsupported*`] variant today:
 //!
-//! - Fixed-size arrays inside structs (`BaseType::Array`) — element
-//!   windows like vectors-of-structs but inline; deferred separately.
 //! - Union variants other than table (struct or string variants).
 //! - `BaseType::Vector64` — element-offset arithmetic uses 64-bit
 //!   offsets and `flatbuffers::Vector<T>` only handles 32-bit;
@@ -658,6 +663,20 @@ fn struct_bytesize(object: &Object) -> Result<usize, ExecuteError> {
     Ok(usize::try_from(raw).expect("non-negative after the explicit ≤ 0 guard above"))
 }
 
+/// Byte size of a scalar `BaseType` when stored inline (in a
+/// struct field, a fixed-size array element, or a vector element).
+/// Returns `None` for non-scalar types (`Obj`, `String`, `Vector`,
+/// `Vector64`, `Union`, `Array`, `None`).
+fn scalar_byte_size(base_type: BaseType) -> Option<usize> {
+    Some(match base_type {
+        BaseType::Bool | BaseType::Byte | BaseType::UByte | BaseType::UType => 1,
+        BaseType::Short | BaseType::UShort => 2,
+        BaseType::Int | BaseType::UInt | BaseType::Float => 4,
+        BaseType::Long | BaseType::ULong | BaseType::Double => 8,
+        _ => return None,
+    })
+}
+
 /// Resolve the `(key)`-annotated field on `child_object` (the table
 /// type of vector elements). FlatBuffers guarantees at most one
 /// `(key)` field per table; we still error explicitly if zero are
@@ -998,15 +1017,6 @@ fn walk_struct(
     let field_offset = usize::from(field.offset());
     let base_type = field.type_().base_type();
 
-    if tail.is_empty() {
-        // Scalar leaf inside the struct. Strings / sub-tables /
-        // vectors / unions cannot appear in structs, so reject any
-        // non-scalar leaf with the same `UnsupportedType` shape we
-        // use for non-leaf scalars in `read_leaf`.
-        return read_struct_scalar_leaf(buf, struct_loc + field_offset, &field, base_type)
-            .map(|opt| vec![opt]);
-    }
-
     match base_type {
         BaseType::Obj => {
             let child_index = field.type_().index();
@@ -1032,18 +1042,27 @@ fn walk_struct(
                     child_object.name()
                 )));
             }
+            // Empty `tail` here means the user stopped at a nested
+            // struct field (e.g. `Holder:b.inner`); `walk_struct`'s
+            // top-of-function check raises the "no v0.1 textual
+            // leaf form" error.
             walk_struct(buf, struct_loc + field_offset, &child_object, schema, tail)
         }
-        BaseType::Array => Err(ExecuteError::UnsupportedType {
-            field: field_name.to_string(),
-            type_name: "fixed-size array (deferred to a future slice)",
-        }),
-        // Scalar with a non-empty tail: same "can't descend into a
-        // scalar" error `walk_table` raises.
-        other => Err(ExecuteError::UnsupportedType {
-            field: field_name.to_string(),
-            type_name: base_type_name(other),
-        }),
+        BaseType::Array => walk_array(buf, struct_loc + field_offset, &field, schema, tail),
+        // Scalar field. Empty `tail` is the leaf path; non-empty
+        // `tail` is "can't descend into a scalar" (mirrors the
+        // analogous arm in `walk_table` via `read_leaf`).
+        other => {
+            if tail.is_empty() {
+                read_struct_scalar_leaf(buf, struct_loc + field_offset, &field, other)
+                    .map(|opt| vec![opt])
+            } else {
+                Err(ExecuteError::UnsupportedType {
+                    field: field_name.to_string(),
+                    type_name: base_type_name(other),
+                })
+            }
+        }
     }
 }
 
@@ -1098,6 +1117,184 @@ fn read_struct_scalar_leaf(
         }
     };
     Ok(Some(s))
+}
+
+/// Walk a fixed-size array field at byte offset `array_loc` inside
+/// `buf`. Arrays only legally appear *inside structs*, so this is
+/// reached only from `walk_struct`'s `BaseType::Array` arm.
+///
+/// Wire layout (FlatBuffers schema rules):
+///
+/// - The N elements live contiguously starting at `array_loc`.
+/// - Element type comes from `field.type_().element()` and may be
+///   either a scalar or `Obj` (where the referenced `Object` is a
+///   struct — flatc forbids array-of-table / array-of-string).
+/// - Element stride is the scalar size for scalar elements or the
+///   struct's `bytesize()` for struct elements.
+/// - `field.type_().fixed_length()` is the (`u16`) element count
+///   declared in the schema; the buffer always carries exactly
+///   that many elements (no run-time count word).
+///
+/// Empty step list at an array is a hard error (mirrors the
+/// "no v0.1 textual leaf form" behaviour of structs and
+/// vector-of-structs); callers descend with `[i]` or `[*]`.
+/// `[map-key]` / `|keys` are rejected because arrays carry no
+/// `(key)` annotation, and `.field` / `|type` are static
+/// type-system mismatches at this position.
+fn walk_array(
+    buf: &[u8],
+    array_loc: usize,
+    field: &Field,
+    schema: &Schema,
+    steps: &[Step],
+) -> Result<Vec<Option<String>>, ExecuteError> {
+    let field_name = field.name();
+    let element_type = field.type_().element();
+    let fixed_length = usize::from(field.type_().fixed_length());
+
+    // Resolve element stride (and child object, when struct-typed).
+    let (elem_size, child_object): (usize, Option<Object>) = match element_type {
+        BaseType::Obj => {
+            let child_index = field.type_().index();
+            if child_index < 0 {
+                return Err(ExecuteError::Internal(format!(
+                    "schema array field {field_name:?} has element BaseType::Obj \
+                     but negative object index ({child_index})"
+                )));
+            }
+            let child_object = schema.objects().get(
+                usize::try_from(child_index)
+                    .expect("non-negative after the explicit < 0 guard above"),
+            );
+            // flatc rejects array-of-table at schema-compile time;
+            // surface a malformed `.bfbs` rather than silently
+            // calling `walk_struct` on table-shaped bytes.
+            if !child_object.is_struct() {
+                return Err(ExecuteError::Internal(format!(
+                    "schema array field {field_name:?} has Obj element pointing \
+                     at non-struct object {:?}",
+                    child_object.name()
+                )));
+            }
+            let bytesize = struct_bytesize(&child_object)?;
+            (bytesize, Some(child_object))
+        }
+        scalar => {
+            let size = scalar_byte_size(scalar).ok_or_else(|| ExecuteError::UnsupportedType {
+                field: field_name.to_string(),
+                type_name: base_type_name(scalar),
+            })?;
+            (size, None)
+        }
+    };
+
+    let (head, tail) = match steps.split_first() {
+        Some(p) => p,
+        None => {
+            return Err(ExecuteError::UnsupportedType {
+                field: field_name.to_string(),
+                type_name: "fixed-size array (no v0.1 textual leaf form — descend with [i] or [*])",
+            });
+        }
+    };
+
+    match head {
+        Step::Index(i) => {
+            let idx = *i;
+            if idx >= fixed_length {
+                // OOB short-circuits to NULL per design §4.3,
+                // matching the vector arms.
+                return Ok(vec![None]);
+            }
+            let elem_loc = array_loc + idx * elem_size;
+            walk_array_element(
+                buf,
+                elem_loc,
+                element_type,
+                child_object.as_ref(),
+                field,
+                schema,
+                tail,
+            )
+        }
+        Step::All => {
+            // Fanout: one leaf per element, wire-format order.
+            let mut out = Vec::with_capacity(fixed_length);
+            for idx in 0..fixed_length {
+                let elem_loc = array_loc + idx * elem_size;
+                let mut sub = walk_array_element(
+                    buf,
+                    elem_loc,
+                    element_type,
+                    child_object.as_ref(),
+                    field,
+                    schema,
+                    tail,
+                )?;
+                out.append(&mut sub);
+            }
+            Ok(out)
+        }
+        Step::MapKey(_) => Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name:
+                "[map-key] on fixed-size array (arrays have no (key) annotation; use [i] or [*])",
+        }),
+        Step::MapKeys => Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: "|keys on fixed-size array (arrays have no (key) annotation)",
+        }),
+        Step::Field(_) => Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: ".field on fixed-size array (use [i] or [*] first)",
+        }),
+        Step::UnionType => Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: "|type on fixed-size array (arrays hold no unions)",
+        }),
+    }
+}
+
+/// Read or descend into a single fixed-size array element at
+/// `elem_loc`. Splits on the element's `BaseType`:
+///
+/// - `Obj` (struct) with non-empty `tail` → descend via
+///   [`walk_struct`]. Empty `tail` is rejected (struct elements
+///   have no v0.1 textual leaf form, mirroring vector-of-struct).
+/// - Scalar with empty `tail` → stringify via
+///   [`read_struct_scalar_leaf`] (same scalar formatting as table /
+///   struct / vector-element leaves).
+/// - Scalar with non-empty `tail` → "can't descend into a scalar"
+///   rejection.
+fn walk_array_element(
+    buf: &[u8],
+    elem_loc: usize,
+    element_type: BaseType,
+    child_object: Option<&Object>,
+    field: &Field,
+    schema: &Schema,
+    tail: &[Step],
+) -> Result<Vec<Option<String>>, ExecuteError> {
+    let field_name = field.name();
+    if element_type == BaseType::Obj {
+        let child = child_object.expect("Obj element implies child_object resolved by walk_array");
+        if tail.is_empty() {
+            return Err(ExecuteError::UnsupportedType {
+                field: field_name.to_string(),
+                type_name: "fixed-size-array-of-struct element (no v0.1 textual leaf form — descend with `.field`)",
+            });
+        }
+        return walk_struct(buf, elem_loc, child, schema, tail);
+    }
+
+    if !tail.is_empty() {
+        return Err(ExecuteError::UnsupportedType {
+            field: field_name.to_string(),
+            type_name: base_type_name(element_type),
+        });
+    }
+
+    read_struct_scalar_leaf(buf, elem_loc, field, element_type).map(|opt| vec![opt])
 }
 
 // ---------------------------------------------------------------------------
@@ -4009,5 +4206,396 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    // -- fixed-size arrays inside structs (BaseType::Array) --
+
+    /// Build a schema exercising both array element shapes:
+    ///
+    /// ```text
+    /// struct Vec3   { x:float; y:float; z:float; }   // bytesize 12, align 4
+    /// struct Bundle {
+    ///   xs:  [float:3];   // offset 0,  size 12 (scalar elements)
+    ///   pts: [Vec3:2];    // offset 12, size 24 (struct elements)
+    /// }                                              // bytesize 36, align 4
+    /// table Holder {
+    ///   b: Bundle;        // id 0, vtable offset 4 (inline struct)
+    /// }
+    /// root_type Holder;
+    /// ```
+    ///
+    /// Object vector is sorted alphabetically:
+    /// `Bundle` (0), `Holder` (1), `Vec3` (2).
+    fn build_holder_schema() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+
+        let float_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Float,
+                ..Default::default()
+            },
+        );
+
+        // -- struct Vec3 --
+        let vx_n = fbb.create_string("x");
+        let vx = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(vx_n),
+                type_: Some(float_t),
+                id: 0,
+                offset: 0,
+                ..Default::default()
+            },
+        );
+        let vy_n = fbb.create_string("y");
+        let vy = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(vy_n),
+                type_: Some(float_t),
+                id: 1,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let vz_n = fbb.create_string("z");
+        let vz = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(vz_n),
+                type_: Some(float_t),
+                id: 2,
+                offset: 8,
+                ..Default::default()
+            },
+        );
+        let vec3_fields = fbb.create_vector(&[vx, vy, vz]);
+        let vec3_n = fbb.create_string("Vec3");
+        let vec3 = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(vec3_n),
+                fields: Some(vec3_fields),
+                is_struct: true,
+                bytesize: 12,
+                minalign: 4,
+                ..Default::default()
+            },
+        );
+
+        // -- struct Bundle { xs:[float:3] @0; pts:[Vec3:2] @12; } --
+        // Vec3 sorts as object index 2 (Bundle (0), Holder (1), Vec3 (2)).
+        let xs_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Array,
+                element: BaseType::Float,
+                fixed_length: 3,
+                ..Default::default()
+            },
+        );
+        let pts_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Array,
+                element: BaseType::Obj,
+                index: 2,
+                fixed_length: 2,
+                ..Default::default()
+            },
+        );
+        let pts_n = fbb.create_string("pts");
+        let pts_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(pts_n),
+                type_: Some(pts_t),
+                id: 1,
+                offset: 12,
+                ..Default::default()
+            },
+        );
+        let xs_n = fbb.create_string("xs");
+        let xs_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(xs_n),
+                type_: Some(xs_t),
+                id: 0,
+                offset: 0,
+                ..Default::default()
+            },
+        );
+        // Field vector sorted alphabetically: pts (p) < xs (x).
+        let bundle_fields = fbb.create_vector(&[pts_f, xs_f]);
+        let bundle_n = fbb.create_string("Bundle");
+        let bundle = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(bundle_n),
+                fields: Some(bundle_fields),
+                is_struct: true,
+                bytesize: 36,
+                minalign: 4,
+                ..Default::default()
+            },
+        );
+
+        // -- table Holder { b: Bundle } --
+        // Bundle sorts as object index 0.
+        let bundle_obj_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Obj,
+                index: 0,
+                ..Default::default()
+            },
+        );
+        let b_n = fbb.create_string("b");
+        let b_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(b_n),
+                type_: Some(bundle_obj_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let holder_fields = fbb.create_vector(&[b_f]);
+        let holder_n = fbb.create_string("Holder");
+        let holder = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(holder_n),
+                fields: Some(holder_fields),
+                ..Default::default()
+            },
+        );
+
+        let objects = fbb.create_vector(&[bundle, holder, vec3]);
+        let enums = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum>>(&[]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(holder),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// Mirror of the `Bundle` struct above. `repr(C, packed)`
+    /// matches the FlatBuffers wire layout for structs (no compiler
+    /// padding; nested struct elements use [`TestVec3`]).
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    struct TestBundle {
+        xs: [f32; 3],
+        pts: [TestVec3; 2],
+    }
+
+    // SAFETY: see [`TestVec3`].
+    impl flatbuffers::Push for TestBundle {
+        type Output = TestBundle;
+        unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+            let src = std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            );
+            dst[..src.len()].copy_from_slice(src);
+        }
+    }
+
+    /// Build a `Holder` buffer containing the supplied `Bundle`.
+    /// `b` is `Option<>` so absent-struct cases reuse the same
+    /// fixture; `None` omits the field entirely.
+    fn build_holder_buf(b: Option<TestBundle>) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let t = fbb.start_table();
+        if let Some(v) = b {
+            fbb.push_slot_always(4, v); // slot 4 = b (inline struct)
+        }
+        let h = fbb.end_table(t);
+        fbb.finish_minimal(h);
+        fbb.finished_data().to_vec()
+    }
+
+    fn run_holder(query_str: &str, buf: &[u8], bfbs: &[u8]) -> Option<String> {
+        let schema = root_as_schema(bfbs).expect("test schema verifies");
+        let query = parse(query_str).expect("test query parses");
+        execute(buf, &schema, &query, &Bounds::default())
+            .expect("test execute succeeds")
+            .into_iter()
+            .next()
+            .flatten()
+    }
+
+    fn run_holder_all(query_str: &str, buf: &[u8], bfbs: &[u8]) -> Vec<Option<String>> {
+        let schema = root_as_schema(bfbs).expect("test schema verifies");
+        let query = parse(query_str).expect("test query parses");
+        execute(buf, &schema, &query, &Bounds::default()).expect("test execute succeeds")
+    }
+
+    fn run_holder_err(query_str: &str, buf: &[u8], bfbs: &[u8]) -> ExecuteError {
+        let schema = root_as_schema(bfbs).expect("test schema verifies");
+        let query = parse(query_str).expect("test query parses");
+        execute(buf, &schema, &query, &Bounds::default()).unwrap_err()
+    }
+
+    fn sample_bundle() -> TestBundle {
+        TestBundle {
+            xs: [1.0, 2.0, 3.0],
+            pts: [
+                TestVec3 {
+                    x: 10.0,
+                    y: 20.0,
+                    z: 30.0,
+                },
+                TestVec3 {
+                    x: 100.0,
+                    y: 200.0,
+                    z: 300.0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn array_of_scalars_index_returns_element() {
+        let bfbs = build_holder_schema();
+        let buf = build_holder_buf(Some(sample_bundle()));
+        let v = run_holder("Holder:b.xs[1]", &buf, &bfbs);
+        assert_eq!(v.as_deref(), Some("2"));
+        let v = run_holder("Holder:b.xs[0]", &buf, &bfbs);
+        assert_eq!(v.as_deref(), Some("1"));
+        let v = run_holder("Holder:b.xs[2]", &buf, &bfbs);
+        assert_eq!(v.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn array_of_scalars_all_fans_out() {
+        let bfbs = build_holder_schema();
+        let buf = build_holder_buf(Some(sample_bundle()));
+        let v = run_holder_all("Holder:b.xs[*]", &buf, &bfbs);
+        let strs: Vec<Option<&str>> = v.iter().map(|s| s.as_deref()).collect();
+        assert_eq!(strs, vec![Some("1"), Some("2"), Some("3")]);
+    }
+
+    #[test]
+    fn array_of_scalars_oob_index_returns_none() {
+        let bfbs = build_holder_schema();
+        let buf = build_holder_buf(Some(sample_bundle()));
+        // Per design §4.3, OOB indices short-circuit to NULL.
+        let v = run_holder_all("Holder:b.xs[99]", &buf, &bfbs);
+        assert_eq!(v, vec![None]);
+    }
+
+    #[test]
+    fn array_of_scalars_at_leaf_errors() {
+        let bfbs = build_holder_schema();
+        let buf = build_holder_buf(Some(sample_bundle()));
+        // No textual leaf form for an array — must descend.
+        let err = run_holder_err("Holder:b.xs", &buf, &bfbs);
+        assert!(
+            matches!(
+                &err,
+                ExecuteError::UnsupportedType { type_name, .. }
+                    if type_name.contains("fixed-size array")
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn array_of_struct_index_then_field() {
+        let bfbs = build_holder_schema();
+        let buf = build_holder_buf(Some(sample_bundle()));
+        // Element 0 is {10,20,30}; element 1 is {100,200,300}.
+        let v = run_holder("Holder:b.pts[0].y", &buf, &bfbs);
+        assert_eq!(v.as_deref(), Some("20"));
+        let v = run_holder("Holder:b.pts[1].z", &buf, &bfbs);
+        assert_eq!(v.as_deref(), Some("300"));
+    }
+
+    #[test]
+    fn array_of_struct_all_field_fanout() {
+        let bfbs = build_holder_schema();
+        let buf = build_holder_buf(Some(sample_bundle()));
+        let v = run_holder_all("Holder:b.pts[*].x", &buf, &bfbs);
+        let strs: Vec<Option<&str>> = v.iter().map(|s| s.as_deref()).collect();
+        assert_eq!(strs, vec![Some("10"), Some("100")]);
+    }
+
+    #[test]
+    fn array_of_struct_oob_index_returns_none() {
+        let bfbs = build_holder_schema();
+        let buf = build_holder_buf(Some(sample_bundle()));
+        let v = run_holder_all("Holder:b.pts[5].x", &buf, &bfbs);
+        assert_eq!(v, vec![None]);
+    }
+
+    #[test]
+    fn array_of_struct_at_leaf_index_errors() {
+        let bfbs = build_holder_schema();
+        let buf = build_holder_buf(Some(sample_bundle()));
+        // Struct elements have no textual leaf form — must descend
+        // with `.field`.
+        let err = run_holder_err("Holder:b.pts[0]", &buf, &bfbs);
+        assert!(
+            matches!(
+                &err,
+                ExecuteError::UnsupportedType { type_name, .. }
+                    if type_name.contains("fixed-size-array-of-struct element")
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn array_with_map_key_errors() {
+        let bfbs = build_holder_schema();
+        let buf = build_holder_buf(Some(sample_bundle()));
+        // Arrays carry no `(key)` annotation, so `[abc]` is a
+        // schema-level error.
+        let err = run_holder_err("Holder:b.xs[abc]", &buf, &bfbs);
+        assert!(
+            matches!(
+                &err,
+                ExecuteError::UnsupportedType { type_name, .. }
+                    if type_name.contains("[map-key] on fixed-size array")
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn array_with_keys_errors() {
+        let bfbs = build_holder_schema();
+        let buf = build_holder_buf(Some(sample_bundle()));
+        let err = run_holder_err("Holder:b.xs|keys", &buf, &bfbs);
+        assert!(
+            matches!(
+                &err,
+                ExecuteError::UnsupportedType { type_name, .. }
+                    if type_name.contains("|keys on fixed-size array")
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn array_absent_struct_returns_none() {
+        let bfbs = build_holder_schema();
+        // `b` is absent from the table → walk_table short-circuits
+        // before walk_struct/walk_array gets a chance to descend.
+        let buf = build_holder_buf(None);
+        let v = run_holder_all("Holder:b.xs[1]", &buf, &bfbs);
+        assert_eq!(v, vec![None]);
     }
 }
