@@ -17,16 +17,24 @@
 //! | JSON object | table |
 //! | sibling `<name>_type` + `<name>` pair | union (string + table variants) |
 //!
+//! Inline **struct** fields in tables, **struct union variants**, and
+//! **fixed-size arrays** inside structs are all supported via the
+//! reflection-driven byte-layout encoder ([`build_struct_bytes`]) plus
+//! a const-generic [`InlineStruct`] `Push` adapter that the
+//! FlatBuffers builder uses for inline placement / out-of-line union
+//! values. Struct `bytesize` is dispatched at runtime against a fixed
+//! table of common sizes (see [`push_struct_inline_to_slot`] /
+//! [`push_struct_out_of_line`]); unusual sizes raise
+//! [`FromJsonError::Unsupported`] rather than silently corrupting
+//! the layout.
+//!
 //! ## v0.1 deferrals (rejected with [`FromJsonError::Unsupported`]):
 //!
-//! - **Inline struct fields in tables** (e.g. `Point { pos:Vec3 }`).
-//!   Inlining variable-sized struct bytes via the FlatBuffers builder
-//!   requires a `Push` impl with the struct's static byte size, and
-//!   reflection-driven struct sizes are dynamic — adding it cleanly is
-//!   a separate sub-slice (const-generic dispatch on `bytesize`).
-//! - **Struct union variants** — same reason.
-//! - **Fixed-size arrays** (`BaseType::Array`) — only legal inside
-//!   structs, which we don't yet handle.
+//! - **Vectors of structs.** Element stride in a vector body must
+//!   equal the struct's exact `bytesize` *and* alignment, so we'd need
+//!   const-generic dispatch on the `(size, alignment)` pair rather
+//!   than size alone. Inline placement (table field, union variant)
+//!   tolerates over-alignment; vector-element placement does not.
 //! - **`(hex)` attribute on `[ubyte]`** — always interpreted as base64.
 //! - **`pg_flatbuffers.from_json_unknown = ignore` GUC** — unknown keys
 //!   always raise [`FromJsonError::UnknownField`] in v0.1.
@@ -203,6 +211,10 @@ fn build_table<'fbb>(
     enum SlotPush {
         Scalar(ScalarSlot),
         Offset(WIPOffset<UnionWIPOffset>),
+        /// Inline struct: raw bytes to copy directly into the
+        /// table's body at the field's vtable slot. Sized
+        /// dispatch happens in [`push_struct_inline_to_slot`].
+        InlineStruct(Vec<u8>),
         UnionPair {
             disc: u8,
             value_off: Option<WIPOffset<UnionWIPOffset>>,
@@ -271,15 +283,25 @@ fn build_table<'fbb>(
                 }
             },
             BaseType::Obj => {
-                // Table or struct. Structs are deferred (see module
-                // docs); reject cleanly.
                 let child_idx = u_index(field.type_().index(), "Obj field")?;
                 let child_object = schema.objects().get(child_idx);
                 if child_object.is_struct() {
-                    return Err(FromJsonError::Unsupported {
-                        field: field_name.to_string(),
-                        what: "inline struct field in table (deferred)",
-                    });
+                    // Inline struct in a table field: compute the
+                    // raw struct bytes via `build_struct_bytes`,
+                    // stash them in a `SlotPush::InlineStruct` for
+                    // the write phase (no out-of-line WIPOffset
+                    // for a struct field — bytes live in the
+                    // parent table's body).
+                    let sub_obj = value
+                        .as_object()
+                        .ok_or_else(|| FromJsonError::TypeMismatch {
+                            field: field_name.to_string(),
+                            expected: "object",
+                            got: value_kind(value),
+                        })?;
+                    let bytes = build_struct_bytes(sub_obj, &child_object, schema)?;
+                    pending.push((field, SlotPush::InlineStruct(bytes)));
+                    continue;
                 }
                 let sub_obj = value
                     .as_object()
@@ -330,6 +352,9 @@ fn build_table<'fbb>(
             SlotPush::Scalar(s) => push_scalar(fbb, slot, s),
             SlotPush::Offset(off) => {
                 fbb.push_slot_always::<WIPOffset<UnionWIPOffset>>(slot, *off);
+            }
+            SlotPush::InlineStruct(bytes) => {
+                push_struct_inline_to_slot(fbb, slot, bytes, field.name())?;
             }
             SlotPush::UnionPair { disc, value_off } => {
                 // The discriminator slot is always slot-2 (flatc
@@ -638,20 +663,29 @@ fn build_union_pair<'fbb>(
             let obj_idx = u_index(variant_type.index(), "union variant Obj")?;
             let variant_object = schema.objects().get(obj_idx);
             if variant_object.is_struct() {
-                return Err(FromJsonError::Unsupported {
-                    field: field_name.to_string(),
-                    what: "struct union variant (deferred)",
-                });
+                // Struct union variant: build raw struct bytes,
+                // push out-of-line via the const-generic Push
+                // adapter, return the uoffset for the value slot.
+                let sub_obj = value_v
+                    .as_object()
+                    .ok_or_else(|| FromJsonError::TypeMismatch {
+                        field: field_name.to_string(),
+                        expected: "object",
+                        got: value_kind(value_v),
+                    })?;
+                let bytes = build_struct_bytes(sub_obj, &variant_object, schema)?;
+                push_struct_out_of_line(fbb, &bytes, field_name)?
+            } else {
+                let sub_obj = value_v
+                    .as_object()
+                    .ok_or_else(|| FromJsonError::TypeMismatch {
+                        field: field_name.to_string(),
+                        expected: "object",
+                        got: value_kind(value_v),
+                    })?;
+                let sub_off = build_table(sub_obj, &variant_object, schema, fbb, depth, max_depth)?;
+                WIPOffset::new(sub_off.value())
             }
-            let sub_obj = value_v
-                .as_object()
-                .ok_or_else(|| FromJsonError::TypeMismatch {
-                    field: field_name.to_string(),
-                    expected: "object",
-                    got: value_kind(value_v),
-                })?;
-            let sub_off = build_table(sub_obj, &variant_object, schema, fbb, depth, max_depth)?;
-            WIPOffset::new(sub_off.value())
         }
         BaseType::String => {
             let s = value_v
@@ -1085,6 +1119,485 @@ fn decode_enum_value(
     }
 }
 
+// -- struct byte-layout encoder --
+
+/// Build the raw bytes of an inline struct from a JSON object,
+/// following the schema's per-field byte offsets. Structs have no
+/// vtable, so every field is mandatory (no "absent" concept) and is
+/// written at a fixed offset within the [`Object::bytesize`]-byte
+/// buffer.
+///
+/// Recursively handles:
+///
+/// - **Scalars** (incl. enum-typed) — little-endian write at
+///   `field.offset()`.
+/// - **Nested structs** (`BaseType::Obj` pointing at another struct)
+///   — recurse into [`build_struct_bytes`] and copy the returned
+///   bytes at the parent field's offset.
+/// - **Fixed-size arrays** (`BaseType::Array`) — write each element
+///   contiguously at `field.offset() + i * elem_stride`. Element types
+///   may be scalars or structs (per FlatBuffers spec).
+fn build_struct_bytes(
+    obj: &serde_json::Map<String, Value>,
+    object: &Object,
+    schema: &Schema,
+) -> Result<Vec<u8>, FromJsonError> {
+    let object_name = object.name();
+    let bytesize = usize::try_from(object.bytesize()).map_err(|_| {
+        FromJsonError::Internal(format!(
+            "struct {object_name:?} has negative bytesize ({})",
+            object.bytesize()
+        ))
+    })?;
+    let mut bytes = vec![0u8; bytesize];
+
+    // Validate unknown keys.
+    let fields = object.fields();
+    let mut known = std::collections::HashSet::<&str>::with_capacity(fields.len());
+    for i in 0..fields.len() {
+        known.insert(fields.get(i).name());
+    }
+    for key in obj.keys() {
+        if !known.contains(key.as_str()) {
+            return Err(FromJsonError::UnknownField {
+                table: object_name.to_string(),
+                field: key.clone(),
+            });
+        }
+    }
+
+    // Every struct field is mandatory; JSON omission / null is an
+    // error (vs. tables, which tolerate optional absence).
+    for i in 0..fields.len() {
+        let field = fields.get(i);
+        let field_name = field.name();
+        let field_loc = usize::from(field.offset());
+        let value = match obj.get(field_name) {
+            Some(v) if !v.is_null() => v,
+            _ => {
+                return Err(FromJsonError::MissingRequiredField {
+                    table: object_name.to_string(),
+                    field: field_name.to_string(),
+                });
+            }
+        };
+        write_struct_field(&mut bytes, field_loc, &field, value, schema)?;
+    }
+    Ok(bytes)
+}
+
+/// Write a single struct field's bytes at `loc` inside `bytes`.
+fn write_struct_field(
+    bytes: &mut [u8],
+    loc: usize,
+    field: &Field,
+    value: &Value,
+    schema: &Schema,
+) -> Result<(), FromJsonError> {
+    let base_type = field.type_().base_type();
+
+    match base_type {
+        BaseType::Obj => {
+            // Nested struct (flatc forbids tables inside structs).
+            let child_idx = u_index(field.type_().index(), "Obj struct field")?;
+            let child_object = schema.objects().get(child_idx);
+            if !child_object.is_struct() {
+                return Err(FromJsonError::Internal(format!(
+                    "struct field {:?} points at non-struct object {:?}",
+                    field.name(),
+                    child_object.name()
+                )));
+            }
+            let sub_obj = value
+                .as_object()
+                .ok_or_else(|| FromJsonError::TypeMismatch {
+                    field: field.name().to_string(),
+                    expected: "object",
+                    got: value_kind(value),
+                })?;
+            let sub_bytes = build_struct_bytes(sub_obj, &child_object, schema)?;
+            bytes[loc..loc + sub_bytes.len()].copy_from_slice(&sub_bytes);
+            Ok(())
+        }
+        BaseType::Array => write_array_in_struct(bytes, loc, field, value, schema),
+        scalar if is_scalar(scalar) => {
+            write_struct_scalar(bytes, loc, field, value, schema, scalar)
+        }
+        other => Err(FromJsonError::Internal(format!(
+            "struct field {:?} has illegal type {:?} (flatc forbids \
+             strings/vectors/tables/unions inside structs)",
+            field.name(),
+            other.variant_name().unwrap_or("?")
+        ))),
+    }
+}
+
+/// Write a fixed-size array (`BaseType::Array`) of `fixed_length`
+/// elements contiguously at `loc`. Element type is
+/// `field.type_().element()`; stride is the scalar size or
+/// `child_object.bytesize()` for struct elements.
+fn write_array_in_struct(
+    bytes: &mut [u8],
+    loc: usize,
+    field: &Field,
+    value: &Value,
+    schema: &Schema,
+) -> Result<(), FromJsonError> {
+    let element_type = field.type_().element();
+    let count = usize::from(field.type_().fixed_length());
+    let field_name = field.name().to_string();
+
+    let arr = value
+        .as_array()
+        .ok_or_else(|| FromJsonError::TypeMismatch {
+            field: field_name.clone(),
+            expected: "array",
+            got: value_kind(value),
+        })?;
+    if arr.len() != count {
+        return Err(FromJsonError::IntegerOutOfRange {
+            field: field_name.clone(),
+            value: arr.len() as i128,
+            kind: "expected fixed-size array length",
+        });
+    }
+
+    let (elem_size, child_object) = match element_type {
+        BaseType::Obj => {
+            let child_idx = u_index(field.type_().index(), "Array of Obj")?;
+            let child_object = schema.objects().get(child_idx);
+            if !child_object.is_struct() {
+                return Err(FromJsonError::Internal(format!(
+                    "array field {field_name:?} element points at non-struct object"
+                )));
+            }
+            let size = usize::try_from(child_object.bytesize()).map_err(|_| {
+                FromJsonError::Internal(format!(
+                    "array field {field_name:?} struct element bytesize negative"
+                ))
+            })?;
+            (size, Some(child_object))
+        }
+        other => (
+            scalar_size(other).ok_or_else(|| {
+                FromJsonError::Internal(format!(
+                    "array field {field_name:?} has non-scalar element {:?}",
+                    other.variant_name().unwrap_or("?")
+                ))
+            })?,
+            None,
+        ),
+    };
+
+    for (i, v) in arr.iter().enumerate() {
+        let elem_loc = loc + i * elem_size;
+        match &child_object {
+            Some(child) => {
+                let sub_obj = v.as_object().ok_or_else(|| FromJsonError::TypeMismatch {
+                    field: format!("{field_name}[{i}]"),
+                    expected: "object",
+                    got: value_kind(v),
+                })?;
+                let sub_bytes = build_struct_bytes(sub_obj, child, schema)?;
+                bytes[elem_loc..elem_loc + sub_bytes.len()].copy_from_slice(&sub_bytes);
+            }
+            // Scalar array elements. flatc forbids enum-typed array
+            // elements at schema-compile time (would need per-element
+            // schema lookup), so we use the non-enum scalar writer.
+            None => write_scalar_no_enum(bytes, elem_loc, field, v, element_type, i + 1)?,
+        }
+    }
+    Ok(())
+}
+
+/// Write a single struct scalar field at `loc`. Handles enum-typed
+/// scalars (resolve member name → numeric → write as underlying
+/// scalar type) and non-enum scalars uniformly.
+fn write_struct_scalar(
+    bytes: &mut [u8],
+    loc: usize,
+    field: &Field,
+    value: &Value,
+    schema: &Schema,
+    base_type: BaseType,
+) -> Result<(), FromJsonError> {
+    let is_enum = field.type_().index() >= 0;
+    if is_enum {
+        let enum_def = lookup_enum(field, schema)?;
+        let n = decode_enum_value(field, value, 0, &enum_def)?;
+        return write_enum_scalar(bytes, loc, field, n, base_type);
+    }
+    write_scalar_no_enum(bytes, loc, field, value, base_type, 0)
+}
+
+/// Write a non-enum scalar at `loc`. `idx` is the array-element
+/// index (1-based) for error messages; pass 0 for struct fields to
+/// suppress the `[i]` suffix.
+fn write_scalar_no_enum(
+    bytes: &mut [u8],
+    loc: usize,
+    field: &Field,
+    value: &Value,
+    base_type: BaseType,
+    idx: usize,
+) -> Result<(), FromJsonError> {
+    macro_rules! write {
+        ($t:ty, $v:expr) => {{
+            let v: $t = $v;
+            bytes[loc..loc + std::mem::size_of::<$t>()].copy_from_slice(&v.to_le_bytes());
+        }};
+    }
+    match base_type {
+        BaseType::Bool => {
+            let v = value.as_bool().ok_or_else(|| FromJsonError::TypeMismatch {
+                field: field.name().to_string(),
+                expected: "boolean",
+                got: value_kind(value),
+            })?;
+            bytes[loc] = u8::from(v);
+        }
+        BaseType::Byte => write!(
+            i8,
+            decode_signed_int::<i8>(
+                field,
+                value,
+                idx,
+                i64::from(i8::MIN),
+                i64::from(i8::MAX),
+                "i8"
+            )?
+        ),
+        BaseType::UByte | BaseType::UType => write!(
+            u8,
+            decode_unsigned_int::<u8>(field, value, idx, u64::from(u8::MAX), "u8")?
+        ),
+        BaseType::Short => write!(
+            i16,
+            decode_signed_int::<i16>(
+                field,
+                value,
+                idx,
+                i64::from(i16::MIN),
+                i64::from(i16::MAX),
+                "i16"
+            )?
+        ),
+        BaseType::UShort => write!(
+            u16,
+            decode_unsigned_int::<u16>(field, value, idx, u64::from(u16::MAX), "u16")?
+        ),
+        BaseType::Int => write!(
+            i32,
+            decode_signed_int::<i32>(
+                field,
+                value,
+                idx,
+                i64::from(i32::MIN),
+                i64::from(i32::MAX),
+                "i32"
+            )?
+        ),
+        BaseType::UInt => write!(
+            u32,
+            decode_unsigned_int::<u32>(field, value, idx, u64::from(u32::MAX), "u32")?
+        ),
+        BaseType::Long => write!(
+            i64,
+            decode_signed_int::<i64>(field, value, idx, i64::MIN, i64::MAX, "i64")?
+        ),
+        BaseType::ULong => write!(
+            u64,
+            decode_unsigned_int::<u64>(field, value, idx, u64::MAX, "u64")?
+        ),
+        BaseType::Float => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "narrowed to f32 with possible loss"
+            )]
+            let v = decode_float(field, value, idx)? as f32;
+            write!(f32, v)
+        }
+        BaseType::Double => write!(f64, decode_float(field, value, idx)?),
+        other => {
+            return Err(FromJsonError::Internal(format!(
+                "write_scalar_no_enum: unexpected base_type {:?}",
+                other.variant_name().unwrap_or("?")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Write an enum-typed scalar's already-resolved integer
+/// discriminator at `loc`, casting to the underlying scalar type.
+fn write_enum_scalar(
+    bytes: &mut [u8],
+    loc: usize,
+    field: &Field,
+    n: i64,
+    base_type: BaseType,
+) -> Result<(), FromJsonError> {
+    macro_rules! write {
+        ($t:ty, $v:expr) => {{
+            let v: $t = $v;
+            bytes[loc..loc + std::mem::size_of::<$t>()].copy_from_slice(&v.to_le_bytes());
+        }};
+    }
+    match base_type {
+        BaseType::Byte => write!(i8, n.try_into().map_err(|_| out_of_range(field, n, "i8"))?),
+        BaseType::UByte | BaseType::UType => {
+            write!(u8, n.try_into().map_err(|_| out_of_range(field, n, "u8"))?)
+        }
+        BaseType::Short => write!(
+            i16,
+            n.try_into().map_err(|_| out_of_range(field, n, "i16"))?
+        ),
+        BaseType::UShort => write!(
+            u16,
+            n.try_into().map_err(|_| out_of_range(field, n, "u16"))?
+        ),
+        BaseType::Int => write!(
+            i32,
+            n.try_into().map_err(|_| out_of_range(field, n, "i32"))?
+        ),
+        BaseType::UInt => write!(
+            u32,
+            n.try_into().map_err(|_| out_of_range(field, n, "u32"))?
+        ),
+        BaseType::Long => write!(i64, n),
+        BaseType::ULong => write!(
+            u64,
+            u64::try_from(n).map_err(|_| out_of_range(field, n, "u64"))?
+        ),
+        other => {
+            return Err(FromJsonError::Internal(format!(
+                "write_enum_scalar: enum on non-integer base_type {:?}",
+                other.variant_name().unwrap_or("?")
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn out_of_range(field: &Field, n: i64, kind: &'static str) -> FromJsonError {
+    FromJsonError::IntegerOutOfRange {
+        field: field.name().to_string(),
+        value: i128::from(n),
+        kind,
+    }
+}
+
+// -- inline-struct Push adapter --
+
+/// Const-generic wrapper that implements [`flatbuffers::Push`] for a
+/// raw `[u8; N]`. Used to inject struct bytes into either an inline
+/// table slot ([`push_struct_inline_to_slot`]) or an out-of-line
+/// union-value position ([`push_struct_out_of_line`]).
+///
+/// Alignment is fixed at 8 (the maximum FlatBuffers scalar alignment).
+/// This **over-aligns** structs whose `minalign` is 1/2/4, which is
+/// safe for *single* placements (the slot/uoffset captures the actual
+/// position) but would corrupt the element stride of a vector of
+/// structs — hence the v0.1 deferral of vector-of-struct on the
+/// from_json side.
+#[repr(C)]
+struct InlineStruct<const N: usize>([u8; N]);
+
+impl<const N: usize> flatbuffers::Push for InlineStruct<N> {
+    type Output = InlineStruct<N>;
+    // SAFETY contract: caller has made `size()` bytes available in `dst`.
+    unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+        dst[..N].copy_from_slice(&self.0);
+    }
+    fn size() -> usize {
+        N
+    }
+    fn alignment() -> flatbuffers::PushAlignment {
+        flatbuffers::PushAlignment::new(8)
+    }
+}
+
+/// Dispatch macro: copy `bytes` into an `InlineStruct<N>` for a
+/// `bytes.len()` selected from a fixed table of common sizes, then
+/// hand it off to the caller-provided `$action` (push_slot_always or
+/// fbb.push). Unusual sizes return [`FromJsonError::Unsupported`].
+macro_rules! dispatch_inline_struct {
+    ($bytes:expr, $field_name:expr, |$arr:ident| $action:expr) => {{
+        macro_rules! arm {
+            ($n:literal) => {{
+                let mut tmp = [0u8; $n];
+                tmp.copy_from_slice($bytes);
+                let $arr = InlineStruct::<$n>(tmp);
+                $action
+            }};
+        }
+        match $bytes.len() {
+            1 => arm!(1),
+            2 => arm!(2),
+            3 => arm!(3),
+            4 => arm!(4),
+            6 => arm!(6),
+            8 => arm!(8),
+            10 => arm!(10),
+            12 => arm!(12),
+            14 => arm!(14),
+            16 => arm!(16),
+            20 => arm!(20),
+            24 => arm!(24),
+            28 => arm!(28),
+            32 => arm!(32),
+            36 => arm!(36),
+            40 => arm!(40),
+            44 => arm!(44),
+            48 => arm!(48),
+            56 => arm!(56),
+            64 => arm!(64),
+            72 => arm!(72),
+            80 => arm!(80),
+            96 => arm!(96),
+            128 => arm!(128),
+            192 => arm!(192),
+            256 => arm!(256),
+            other => {
+                let _ = other;
+                return Err(FromJsonError::Unsupported {
+                    field: $field_name.to_string(),
+                    what: "struct bytesize not in v0.1 inline dispatch table",
+                });
+            }
+        }
+    }};
+}
+
+/// Push `bytes` as an inline struct at vtable `slot` inside the
+/// currently-being-built table.
+fn push_struct_inline_to_slot(
+    fbb: &mut FlatBufferBuilder<'_>,
+    slot: u16,
+    bytes: &[u8],
+    field_name: &str,
+) -> Result<(), FromJsonError> {
+    dispatch_inline_struct!(bytes, field_name, |s| {
+        fbb.push_slot_always(slot, s);
+    });
+    Ok(())
+}
+
+/// Push `bytes` as an *out-of-line* struct and return a
+/// [`WIPOffset<UnionWIPOffset>`] suitable for the union-value slot.
+fn push_struct_out_of_line<'fbb>(
+    fbb: &mut FlatBufferBuilder<'fbb>,
+    bytes: &[u8],
+    field_name: &str,
+) -> Result<WIPOffset<UnionWIPOffset>, FromJsonError> {
+    let out: WIPOffset<UnionWIPOffset>;
+    dispatch_inline_struct!(bytes, field_name, |s| {
+        let off = fbb.push(s);
+        out = WIPOffset::new(off.value());
+    });
+    Ok(out)
+}
+
 // -- helpers --
 
 fn is_scalar(b: BaseType) -> bool {
@@ -1140,6 +1653,18 @@ fn u_index(i: i32, what: &'static str) -> Result<usize, FromJsonError> {
         return Err(FromJsonError::Internal(format!("{what} is negative ({i})")));
     }
     Ok(i as usize)
+}
+
+/// Byte size of a scalar `BaseType` for fixed-size array stride
+/// computation. `None` for non-scalar types.
+fn scalar_size(b: BaseType) -> Option<usize> {
+    Some(match b {
+        BaseType::Bool | BaseType::Byte | BaseType::UByte | BaseType::UType => 1,
+        BaseType::Short | BaseType::UShort => 2,
+        BaseType::Int | BaseType::UInt | BaseType::Float => 4,
+        BaseType::Long | BaseType::ULong | BaseType::Double => 8,
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,10 +2040,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn from_json_rejects_struct_field_as_unsupported() {
-        // Build a minimal schema with an inline struct field to verify
-        // the deferral message points at the struct field by name.
+    /// Build a `table P { pos:Vec3; }` schema where
+    /// `struct Vec3 { x:float; y:float; z:float }` (bytesize 12,
+    /// minalign 4). Used for the inline-struct-in-table tests.
+    fn build_point_schema() -> Vec<u8> {
         let mut fbb = FlatBufferBuilder::new();
         let f32_t = Type::create(
             &mut fbb,
@@ -1527,7 +2052,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        // struct Vec3 { x:float; }  (single-field struct, bytesize 4)
+        // struct Vec3 { x:float @0; y:float @4; z:float @8; }
         let xn = fbb.create_string("x");
         let xf = RField::create(
             &mut fbb,
@@ -1539,7 +2064,29 @@ mod tests {
                 ..Default::default()
             },
         );
-        let vec3_fields = fbb.create_vector(&[xf]);
+        let yn = fbb.create_string("y");
+        let yf = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(yn),
+                type_: Some(f32_t),
+                id: 1,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let zn = fbb.create_string("z");
+        let zf = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(zn),
+                type_: Some(f32_t),
+                id: 2,
+                offset: 8,
+                ..Default::default()
+            },
+        );
+        let vec3_fields = fbb.create_vector(&[xf, yf, zf]);
         let vec3_n = fbb.create_string("Vec3");
         let vec3 = RObject::create(
             &mut fbb,
@@ -1547,7 +2094,7 @@ mod tests {
                 name: Some(vec3_n),
                 fields: Some(vec3_fields),
                 is_struct: true,
-                bytesize: 4,
+                bytesize: 12,
                 minalign: 4,
                 ..Default::default()
             },
@@ -1595,13 +2142,165 @@ mod tests {
             },
         );
         fbb.finish(schema_off, None);
-        let bfbs = fbb.finished_data().to_vec();
+        fbb.finished_data().to_vec()
+    }
 
+    #[test]
+    fn from_json_inline_struct_field_round_trips() {
+        let bfbs = build_point_schema();
         let schema = root_as_schema(&bfbs).expect("schema parses");
-        let err = json_to_buf(&json!({ "pos": { "x": 1.0 } }), &schema, 64).unwrap_err();
+        let input = json!({ "pos": { "x": 1.0, "y": 2.0, "z": 3.0 } });
+        let buf = json_to_buf(&input, &schema, 64).expect("from_json ok");
+        crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
+            .expect("buffer verifies");
+        let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
+        assert_eq!(value, input);
+    }
+
+    #[test]
+    fn from_json_inline_struct_rejects_missing_field() {
+        let bfbs = build_point_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        // Missing `z` — struct fields are mandatory (no vtable).
+        let err = json_to_buf(&json!({ "pos": { "x": 1.0, "y": 2.0 } }), &schema, 64).unwrap_err();
         assert!(
-            matches!(&err, FromJsonError::Unsupported { field, what }
-                if field == "pos" && what.contains("struct")),
+            matches!(&err, FromJsonError::MissingRequiredField { table, field }
+                if table == "Vec3" && field == "z"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_json_inline_struct_rejects_unknown_field() {
+        let bfbs = build_point_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let err = json_to_buf(
+            &json!({ "pos": { "x": 1.0, "y": 2.0, "z": 3.0, "w": 4.0 } }),
+            &schema,
+            64,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, FromJsonError::UnknownField { table, field }
+                if table == "Vec3" && field == "w"),
+            "got {err:?}"
+        );
+    }
+
+    /// Build `table H { arr:[int:3]; }` — fixed-size array of 3
+    /// ints, only legal *inside* a struct. So actually we wrap it:
+    /// `struct Bundle { arr:[int:3]; } table H { b:Bundle; }`.
+    fn build_array_schema() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let int_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Int,
+                ..Default::default()
+            },
+        );
+        // arr: [int:3] — element=Int, fixed_length=3, bytesize=12,
+        // alignment=4.
+        let arr_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Array,
+                element: BaseType::Int,
+                fixed_length: 3,
+                ..Default::default()
+            },
+        );
+        let arr_n = fbb.create_string("arr");
+        let arr_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(arr_n),
+                type_: Some(arr_t),
+                id: 0,
+                offset: 0,
+                ..Default::default()
+            },
+        );
+        let bundle_fields = fbb.create_vector(&[arr_f]);
+        let bundle_n = fbb.create_string("Bundle");
+        let bundle = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(bundle_n),
+                fields: Some(bundle_fields),
+                is_struct: true,
+                bytesize: 12,
+                minalign: 4,
+                ..Default::default()
+            },
+        );
+        // table H { b:Bundle; }
+        let bundle_obj_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Obj,
+                index: 0, // Bundle sorts before H
+                ..Default::default()
+            },
+        );
+        let b_n = fbb.create_string("b");
+        let b_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(b_n),
+                type_: Some(bundle_obj_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let h_fields = fbb.create_vector(&[b_f]);
+        let h_n = fbb.create_string("H");
+        let h_obj = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(h_n),
+                fields: Some(h_fields),
+                ..Default::default()
+            },
+        );
+        let _ = int_t; // silence: only used inside the array type for clarity
+        // Objects sorted: Bundle (0), H (1).
+        let objects = fbb.create_vector(&[bundle, h_obj]);
+        let enums = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum>>(&[]);
+        let schema_off = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(h_obj),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema_off, None);
+        fbb.finished_data().to_vec()
+    }
+
+    #[test]
+    fn from_json_fixed_size_array_in_struct_round_trips() {
+        let bfbs = build_array_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let input = json!({ "b": { "arr": [10, 20, 30] } });
+        let buf = json_to_buf(&input, &schema, 64).expect("from_json ok");
+        crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
+            .expect("buffer verifies");
+        let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
+        assert_eq!(value, input);
+    }
+
+    #[test]
+    fn from_json_fixed_size_array_rejects_wrong_length() {
+        let bfbs = build_array_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        // Array has fixed_length=3; supplying 2 elements is an error.
+        let err = json_to_buf(&json!({ "b": { "arr": [10, 20] } }), &schema, 64).unwrap_err();
+        assert!(
+            matches!(&err, FromJsonError::IntegerOutOfRange { field, .. } if field == "arr"),
             "got {err:?}"
         );
     }

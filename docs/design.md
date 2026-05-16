@@ -561,13 +561,17 @@ cover the table above with these carve-outs:
   break round-trip through `from_json`.
 - **`from_json` deferrals** (rejected with a `Unsupported` error that
   names the offending field):
-  - inline struct fields in tables (e.g. `Point { pos:Vec3 }`),
-  - vectors of structs,
-  - struct union variants,
-  - fixed-size arrays (only legal inside structs).
-
-  Adding struct support requires const-generic `Push` dispatch on the
-  struct's `bytesize`; a follow-up commit will land it.
+  - **Vectors of structs.** Element stride must equal the struct's
+    exact `bytesize` *and* alignment, so vector-element placement
+    would need const-generic dispatch on the `(size, alignment)`
+    pair rather than `size` alone. Inline placement (table field,
+    union variant) and out-of-line placement (union value) work
+    today via [`crate::from_json::InlineStruct`] with alignment
+    fixed at 8.
+  - **Struct sizes not in the v0.1 dispatch table.** The walker
+    handles the common multiples (1, 2, 3, 4, 6, 8, 10, 12, 14,
+    16, 20, 24, 28, 32, 36, 40, 44, 48, 56, 64, 72, 80, 96, 128,
+    192, 256); unusual sizes raise a clear error.
 - **`pg_flatbuffers.from_json_unknown = ignore` GUC** is not yet
   wired — unknown JSON keys always `ERROR`.
 - **`max_apparent_size_mb` cap on output buffer** is not enforced on
