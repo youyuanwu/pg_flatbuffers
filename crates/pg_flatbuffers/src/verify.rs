@@ -37,6 +37,18 @@
 //!   (design §4.3 "Vector of unions"). Single-value unions are
 //!   covered by the underlying verifier.
 //!
+//! ## Schema-feature rejection
+//!
+//! Before any buffer bytes are inspected, [`verify`] scans the
+//! reflection schema and rejects v0.1-unsupported features via
+//! [`reject_unsupported_schema_features`]. Today the only such
+//! feature is `BaseType::Vector64` (64-bit-offset vectors), which
+//! would otherwise reach the executor's 32-bit `flatbuffers::Vector`
+//! accessors and silently truncate addresses. Rejection is
+//! per-schema, not per-touched-field: even a query that targets a
+//! Vector64-sibling field fails, because the buffer is under-validated
+//! as a whole.
+//!
 //! ## What is *deferred*
 //!
 //! - **Content-hashed result cache** (design §10 "Verifier result
@@ -46,7 +58,7 @@
 //!   speculatively would be cargo-cult dependency growth.
 
 use flatbuffers::VerifierOptions;
-use flatbuffers_reflection::reflection::Schema;
+use flatbuffers_reflection::reflection::{BaseType, Schema};
 use flatbuffers_reflection::{FlatbufferError, SafeBuffer};
 use thiserror::Error;
 
@@ -130,6 +142,24 @@ pub enum VerifyError {
     /// field, etc.). The string is the upstream diagnostic.
     #[error("buffer rejected by FlatBuffers verifier: {0}")]
     Invalid(String),
+
+    /// The schema uses a FlatBuffers feature that v0.1 does not
+    /// support. Detected *before* the upstream verifier runs so that
+    /// (a) operators get a clear message naming the feature rather
+    /// than a deferred query-time `UnsupportedType`, and (b) the
+    /// soundness boundary stays tight: the executor's unchecked
+    /// accessors only get to see schemas whose features we know we
+    /// can read safely. See [`reject_unsupported_schema_features`]
+    /// for the per-feature list.
+    #[error(
+        "schema uses unsupported FlatBuffers feature {feature}: \
+         table {table:?} field {field:?} (v0.1 does not support this)"
+    )]
+    UnsupportedSchemaFeature {
+        feature: &'static str,
+        table: String,
+        field: String,
+    },
 }
 
 impl VerifyError {
@@ -156,6 +186,18 @@ impl VerifyError {
             _ => false,
         }
     }
+
+    /// True if the failure is the up-front schema-level rejection
+    /// added by [`reject_unsupported_schema_features`]. Consumed by
+    /// [`crate::functions::should_error_on`] (which always ERRORs on
+    /// these, regardless of `pg_flatbuffers.strict`, because a
+    /// schema-feature mismatch is a *config* problem, not a
+    /// buffer-content problem) and by [`crate::functions::flatbuffers_verify`]
+    /// (which surfaces it as ERROR even though its normal contract
+    /// is to swallow verifier failures into `false`).
+    pub fn is_schema_feature_rejection(&self) -> bool {
+        matches!(self, VerifyError::UnsupportedSchemaFeature { .. })
+    }
 }
 
 /// Verify `buf` against `schema` under `bounds`. On success the buffer
@@ -177,6 +219,15 @@ pub fn verify(buf: &[u8], schema: &Schema<'_>, bounds: &Bounds) -> Result<(), Ve
     if schema.root_table().is_none() {
         return Err(VerifyError::NoRootTable);
     }
+
+    // Reject schemas containing v0.1-unsupported features (Vector64
+    // today) *before* handing the buffer to the upstream verifier.
+    // The upstream verifier doesn't yet validate Vector64 payloads
+    // (and even if it did, our executor's `flatbuffers::Vector<T>`
+    // accessors only handle 32-bit offsets), so accepting a Vector64
+    // schema here would risk reading from an under-validated region
+    // when a query touches a *sibling* field. Fail loud and early.
+    reject_unsupported_schema_features(schema)?;
 
     let opts = bounds.to_options();
     // `SafeBuffer::new_with_options` is the upstream public entry
@@ -204,6 +255,36 @@ pub fn verify(buf: &[u8], schema: &Schema<'_>, bounds: &Bounds) -> Result<(), Ve
         })
 }
 
+/// Walk every object's fields in `schema` and reject any field whose
+/// type uses a FlatBuffers feature that v0.1 doesn't support.
+///
+/// Today the list is exactly one entry: `BaseType::Vector64`, a
+/// vector type that addresses elements via 64-bit offsets.
+/// `flatbuffers::Vector<T>` (used by our executor) only handles
+/// 32-bit offsets, so any access would silently truncate addresses.
+/// Rejection is at *schema* granularity, not field-touched
+/// granularity — see the call site in [`verify`] for rationale.
+///
+/// Pure scan; no allocation beyond the `String` payloads of the
+/// error variant on rejection. O(total fields in schema), but every
+/// well-formed schema has a bounded number of objects per design
+/// §10 so this is a single linear pass over reflection metadata.
+fn reject_unsupported_schema_features(schema: &Schema<'_>) -> Result<(), VerifyError> {
+    for object in schema.objects() {
+        for field in object.fields() {
+            let t = field.type_();
+            if t.base_type() == BaseType::Vector64 {
+                return Err(VerifyError::UnsupportedSchemaFeature {
+                    feature: "Vector64",
+                    table: object.name().to_owned(),
+                    field: field.name().to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests (pure Rust — no `cargo pgrx test` needed)
 // ---------------------------------------------------------------------------
@@ -213,7 +294,8 @@ mod tests {
     use super::*;
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers_reflection::reflection::{
-        root_as_schema, Object, ObjectArgs, Schema as RSchema, SchemaArgs,
+        root_as_schema, BaseType, Field, FieldArgs, Object, ObjectArgs, Schema as RSchema,
+        SchemaArgs, Type, TypeArgs,
     };
 
     /// Build a minimal but verifier-clean reflection `Schema` with no
@@ -411,6 +493,127 @@ mod tests {
         assert!(!VerifyError::NoRootTable.is_bound_exceedance());
         assert!(
             !VerifyError::Invalid("Range [0, 4) is out of bounds".to_owned()).is_bound_exceedance()
+        );
+    }
+
+    // -- Vector64 / unsupported-schema-feature rejection --
+
+    /// Build a reflection `Schema` whose root table `V64` has one
+    /// field `items: [int64-offset]`. Mirrors the Vector64 case the
+    /// upstream verifier doesn't fully cover. We're not building a
+    /// matching *buffer* — the schema scan happens before any buffer
+    /// inspection, so any non-empty ≥4-byte buffer triggers the same
+    /// rejection.
+    fn vector64_schema_bfbs() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+
+        // Element type: int (BaseType::Int). The element_base_type
+        // of the Vector64 lives in `element`, not in a nested Type.
+        let items_type = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector64,
+                element: BaseType::Int,
+                ..Default::default()
+            },
+        );
+        let items_name = fbb.create_string("items");
+        let items_field = Field::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(items_name),
+                type_: Some(items_type),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let fields = fbb.create_vector(&[items_field]);
+        let table_name = fbb.create_string("V64");
+        let object = Object::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(table_name),
+                fields: Some(fields),
+                is_struct: false,
+                ..Default::default()
+            },
+        );
+        let objects = fbb.create_vector(&[object]);
+        let enums = fbb.create_vector::<flatbuffers::ForwardsUOffset<
+            flatbuffers_reflection::reflection::Enum,
+        >>(&[]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(object),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    #[test]
+    fn rejects_vector64_schema_before_touching_buffer() {
+        let bfbs = vector64_schema_bfbs();
+        let schema = root_as_schema(&bfbs).unwrap();
+        // Pass garbage bytes: the schema-feature scan fires first,
+        // so we never reach the upstream verifier and never observe
+        // an `Invalid` from the garbage.
+        let err = verify(&[0xDE, 0xAD, 0xBE, 0xEF], &schema, &Bounds::default()).unwrap_err();
+        match err {
+            VerifyError::UnsupportedSchemaFeature {
+                feature,
+                table,
+                field,
+            } => {
+                assert_eq!(feature, "Vector64");
+                assert_eq!(table, "V64");
+                assert_eq!(field, "items");
+            }
+            other => panic!("expected UnsupportedSchemaFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vector64_rejection_message_names_the_feature() {
+        let bfbs = vector64_schema_bfbs();
+        let schema = root_as_schema(&bfbs).unwrap();
+        let err = verify(&[0u8; 8], &schema, &Bounds::default()).unwrap_err();
+        let msg = err.to_string();
+        // Operators should see all three: the feature name, the
+        // table, and the field. Substring checks so we're robust to
+        // any future cosmetic tweaks to the `#[error(...)]` template.
+        assert!(msg.contains("Vector64"), "missing feature name: {msg}");
+        assert!(msg.contains("V64"), "missing table name: {msg}");
+        assert!(msg.contains("items"), "missing field name: {msg}");
+    }
+
+    #[test]
+    fn is_schema_feature_rejection_classifies_variants() {
+        let v64 = VerifyError::UnsupportedSchemaFeature {
+            feature: "Vector64",
+            table: "T".to_owned(),
+            field: "f".to_owned(),
+        };
+        assert!(v64.is_schema_feature_rejection());
+        // Crucially: it is *not* a bound exceedance, so the policy
+        // in `functions::should_error_on` has to consult both
+        // classifiers (a regression here would let `strict = off`
+        // silently swallow Vector64 schemas).
+        assert!(!v64.is_bound_exceedance());
+
+        // Negative cases.
+        assert!(!VerifyError::Empty.is_schema_feature_rejection());
+        assert!(!VerifyError::TooSmall { len: 1 }.is_schema_feature_rejection());
+        assert!(!VerifyError::NoRootTable.is_schema_feature_rejection());
+        assert!(!VerifyError::Invalid("anything".to_owned()).is_schema_feature_rejection());
+        assert!(
+            !VerifyError::Invalid("depth 65 exceeds limit 64".to_owned())
+                .is_schema_feature_rejection()
         );
     }
 }

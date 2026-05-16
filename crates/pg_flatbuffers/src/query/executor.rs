@@ -422,6 +422,14 @@ fn walk_vector(
     // bookkeeping, but element-offset arithmetic uses 64-bit offsets
     // and our `flatbuffers::Vector<T>` accessors only handle 32-bit.
     // Reject loudly so we don't silently truncate addresses.
+    //
+    // Belt-and-suspenders: `verify()` (see `verify::reject_unsupported_schema_features`)
+    // now pre-empts any Vector64 schema *before* the executor runs,
+    // so reaching this branch in production would mean the executor
+    // was invoked on a schema that bypassed `verify()`. The check
+    // stays as defense-in-depth for unit tests and for any future
+    // executor entry point that's added without going through the
+    // verifier wrapper.
     if field.type_().base_type() == BaseType::Vector64 {
         return Err(ExecuteError::UnsupportedType {
             field: field_name.to_string(),
