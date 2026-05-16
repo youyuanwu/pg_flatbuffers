@@ -8,8 +8,8 @@
 //! raise ERROR regardless of `strict`".
 
 use super::util::split_schema_and_table;
-use crate::from_json::json_to_buf;
-use crate::guc::current_bounds;
+use crate::from_json::{BuildOptions, json_to_buf};
+use crate::guc::{current_bounds, current_from_json_unknown_error};
 use crate::schema_cache::lookup_schema;
 use pgrx::prelude::*;
 
@@ -22,10 +22,10 @@ use pgrx::prelude::*;
 /// registered `root_table` or we ERROR.
 ///
 /// JSON nesting is capped at `pg_flatbuffers.max_depth` (reused
-/// from the verifier `Bounds`; default 64). The
-/// `pg_flatbuffers.from_json_unknown = ignore` GUC envisioned in
-/// design §8 is *not* wired in v0.1 — unknown JSON keys always
-/// ERROR.
+/// from the verifier `Bounds`; default 64). Unknown JSON keys are
+/// rejected by default; set `pg_flatbuffers.from_json_unknown = off`
+/// in the session to silently drop them for forward-compat
+/// workflows (design §8).
 ///
 /// Returns SQL `NULL` only when `j` itself is NULL (the
 /// `STRICT` short-circuit). An empty JSON object `{}` builds a
@@ -73,13 +73,19 @@ fn build(table_name: &str, value: serde_json::Value) -> Vec<u8> {
     }
     let schema_view = cached.schema();
 
-    // JSON nesting cap reuses the verifier `max_depth` bound. The
-    // design's `max_build_depth` is a separate concept (pre-walk
-    // before allocation) — wiring it as a distinct GUC is a
-    // follow-up.
-    let max_depth = current_bounds().max_depth;
+    // Per-call build options materialised from current GUCs so a
+    // `SET pg_flatbuffers.*` takes effect on the very next call.
+    // JSON nesting cap reuses the verifier `max_depth` bound; the
+    // design's `max_build_depth` (pre-walk before allocation) is a
+    // separate concept still on the follow-up list.
+    let bounds = current_bounds();
+    let options = BuildOptions {
+        max_depth: bounds.max_depth,
+        unknown_field_is_error: current_from_json_unknown_error(),
+        max_output_size: bounds.max_apparent_size,
+    };
 
-    match json_to_buf(&value, &schema_view, max_depth) {
+    match json_to_buf(&value, &schema_view, &options) {
         Ok(bytes) => bytes,
         Err(e) => error!("flatbuffers_from_json: {e}"),
     }

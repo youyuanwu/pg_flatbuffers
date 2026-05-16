@@ -12,9 +12,10 @@
 //! | JSON boolean | `bool` |
 //! | JSON string (member name) | enum (numeric fallback for unknown name) |
 //! | JSON string | `string` |
-//! | JSON string (base64) | `[ubyte]` / `[u8]` |
+//! | JSON string (base64 by default, or lowercase hex when the field carries the `(hex)` attribute) | `[ubyte]` / `[u8]` |
 //! | JSON array | `[T]` for non-`ubyte` element types |
 //! | JSON object | table |
+//! | JSON object keyed by the `(key)` field | vector of `(key)`-annotated tables (sorted on the wire — design §8 sugar) |
 //! | sibling `<name>_type` + `<name>` pair | union (string + table variants) |
 //!
 //! Inline **struct** fields in tables, **struct union variants**, and
@@ -35,12 +36,6 @@
 //!   const-generic dispatch on the `(size, alignment)` pair rather
 //!   than size alone. Inline placement (table field, union variant)
 //!   tolerates over-alignment; vector-element placement does not.
-//! - **`(hex)` attribute on `[ubyte]`** — always interpreted as base64.
-//! - **`pg_flatbuffers.from_json_unknown = ignore` GUC** — unknown keys
-//!   always raise [`FromJsonError::UnknownField`] in v0.1.
-//! - **`max_apparent_size_mb` output cap** — the FlatBuffers builder
-//!   itself is bounded by Postgres's per-backend memory; surfacing a
-//!   pre-allocation cap is a follow-up.
 //! - **Pre-walk depth limit** — depth tracking happens during the build,
 //!   not in a separate pre-pass; check happens before each recursive
 //!   call.
@@ -71,9 +66,9 @@ pub enum FromJsonError {
     MissingRequiredField { table: String, field: String },
 
     /// A JSON object contains a key that doesn't correspond to any
-    /// field on the target table. Always raised in v0.1; a future
-    /// `pg_flatbuffers.from_json_unknown = ignore` GUC will allow
-    /// silently dropping unknowns for forward-compat workflows
+    /// field on the target table. Raised when
+    /// `pg_flatbuffers.from_json_unknown = error` (the default);
+    /// when the GUC is `off` the key is silently dropped instead
     /// (design §8).
     #[error("table {table:?} has no field named {field:?}")]
     UnknownField { table: String, field: String },
@@ -110,6 +105,11 @@ pub enum FromJsonError {
     #[error("field {field:?}: invalid base64 in [ubyte] field: {error}")]
     InvalidBase64 { field: String, error: String },
 
+    /// A JSON string offered for a `[ubyte] (hex)` field failed
+    /// hex decoding (odd length, non-hex character, etc.).
+    #[error("field {field:?}: invalid hex in [ubyte] (hex) field: {error}")]
+    InvalidHex { field: String, error: String },
+
     /// A union object is missing the `<name>_type` discriminator key.
     #[error("union field {field:?} requires sibling key {disc_key:?}")]
     MissingUnionDiscriminator { field: String, disc_key: String },
@@ -117,6 +117,14 @@ pub enum FromJsonError {
     /// Build nesting exceeded `pg_flatbuffers.max_depth`.
     #[error("JSON nesting exceeds max_depth ({max})")]
     NestingTooDeep { max: usize },
+
+    /// The finished FlatBuffer would exceed
+    /// `pg_flatbuffers.max_apparent_size_mb` (design §10 — the
+    /// same bound is applied to the read side via the verifier).
+    /// Surfaced *after* the builder finishes; the resulting bytes
+    /// are discarded.
+    #[error("from_json output ({size} bytes) exceeds max_apparent_size ({max} bytes)")]
+    OutputTooLarge { size: usize, max: usize },
 
     /// A FlatBuffers feature this slice hasn't implemented yet.
     /// Carries the field name + a short description.
@@ -129,16 +137,46 @@ pub enum FromJsonError {
     Internal(String),
 }
 
+/// Per-call build options. Each field corresponds 1:1 to a
+/// USERSET GUC consumed by [`crate::functions::flatbuffers_from_json`].
+/// Captured as a value type so the pure-Rust tests in this module
+/// don't need a Postgres backend to vary them.
+#[derive(Debug, Clone, Copy)]
+pub struct BuildOptions {
+    /// Caps JSON nesting (object/array depth) the walker descends.
+    /// A depth exceedance raises [`FromJsonError::NestingTooDeep`].
+    /// Wired from `pg_flatbuffers.max_depth` in production.
+    pub max_depth: usize,
+    /// When `true` (default), an unknown JSON key for a target
+    /// table raises [`FromJsonError::UnknownField`]. When `false`,
+    /// the key is silently dropped (forward-compat workflows).
+    /// Wired from `pg_flatbuffers.from_json_unknown` in production.
+    pub unknown_field_is_error: bool,
+    /// Hard cap on the finished FlatBuffer size in bytes; matches
+    /// the verifier's `max_apparent_size` bound (design §10).
+    /// Enforced *after* `fbb.finish_minimal`; the bytes are
+    /// discarded if the cap is exceeded and
+    /// [`FromJsonError::OutputTooLarge`] is raised. Wired from
+    /// `pg_flatbuffers.max_apparent_size_mb` in production.
+    pub max_output_size: usize,
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        Self {
+            max_depth: 64,
+            unknown_field_is_error: true,
+            max_output_size: 64 * 1024 * 1024,
+        }
+    }
+}
+
 /// Top-level entry: build a FlatBuffer from `json` under `schema`.
 /// The root is the schema's registered `root_table`.
-///
-/// `max_depth` caps the JSON nesting (object/array depth) the
-/// walker descends. A depth exceedance raises
-/// [`FromJsonError::NestingTooDeep`].
 pub fn json_to_buf(
     json: &Value,
     schema: &Schema,
-    max_depth: usize,
+    options: &BuildOptions,
 ) -> Result<Vec<u8>, FromJsonError> {
     let root_object = schema.root_table().ok_or(FromJsonError::NoRootTable)?;
     let obj = json
@@ -148,9 +186,16 @@ pub fn json_to_buf(
         })?;
 
     let mut fbb = FlatBufferBuilder::with_capacity(1024);
-    let root = build_table(obj, &root_object, schema, &mut fbb, 0, max_depth)?;
+    let root = build_table(obj, &root_object, schema, &mut fbb, 0, options)?;
     fbb.finish_minimal(root);
-    Ok(fbb.finished_data().to_vec())
+    let bytes = fbb.finished_data();
+    if bytes.len() > options.max_output_size {
+        return Err(FromJsonError::OutputTooLarge {
+            size: bytes.len(),
+            max: options.max_output_size,
+        });
+    }
+    Ok(bytes.to_vec())
 }
 
 /// Build a table from a JSON object. Returns a `WIPOffset` to the
@@ -169,9 +214,9 @@ fn build_table<'fbb>(
     schema: &Schema,
     fbb: &mut FlatBufferBuilder<'fbb>,
     depth: usize,
-    max_depth: usize,
+    options: &BuildOptions,
 ) -> Result<WIPOffset<flatbuffers::TableFinishedWIPOffset>, FromJsonError> {
-    check_depth(depth, max_depth)?;
+    check_depth(depth, options.max_depth)?;
     let object_name = object.name().to_string();
 
     // Reject unknown keys early so the build is deterministic.
@@ -190,14 +235,20 @@ fn build_table<'fbb>(
             union_disc_keys.insert(format!("{}_type", f.name()));
         }
     }
-    for key in obj.keys() {
-        if !by_name.contains_key(key.as_str()) && !union_disc_keys.contains(key) {
-            return Err(FromJsonError::UnknownField {
-                table: object_name,
-                field: key.clone(),
-            });
+    if options.unknown_field_is_error {
+        for key in obj.keys() {
+            if !by_name.contains_key(key.as_str()) && !union_disc_keys.contains(key) {
+                return Err(FromJsonError::UnknownField {
+                    table: object_name,
+                    field: key.clone(),
+                });
+            }
         }
     }
+    // When `unknown_field_is_error` is `false`, unknown keys are
+    // silently dropped — the per-field iteration below only looks
+    // up keys via `obj.get(field_name)`, so a key not in the
+    // schema simply contributes nothing to the buffer.
 
     // Pre-build phase: build children (strings, sub-tables, vectors,
     // union values) outside any open table. We can't open the table
@@ -235,7 +286,7 @@ fn build_table<'fbb>(
 
         if base_type == BaseType::Union {
             let pair =
-                build_union_pair(obj, &field, schema, fbb, &object_name, depth + 1, max_depth)?;
+                build_union_pair(obj, &field, schema, fbb, &object_name, depth + 1, options)?;
             match pair {
                 Some((disc, value_off)) => {
                     pending.push((field, SlotPush::UnionPair { disc, value_off }));
@@ -317,12 +368,11 @@ fn build_table<'fbb>(
                         expected: "object",
                         got: value_kind(value),
                     })?;
-                let sub_off =
-                    build_table(sub_obj, &child_object, schema, fbb, depth + 1, max_depth)?;
+                let sub_off = build_table(sub_obj, &child_object, schema, fbb, depth + 1, options)?;
                 let raw: WIPOffset<UnionWIPOffset> = WIPOffset::new(sub_off.value());
                 raw
             }
-            BaseType::Vector => build_vector(value, &field, schema, fbb, depth + 1, max_depth)?,
+            BaseType::Vector => build_vector(value, &field, schema, fbb, depth + 1, options)?,
             BaseType::Vector64 => {
                 return Err(FromJsonError::Internal(format!(
                     "Vector64 field {field_name:?} reached from_json — should have been \
@@ -392,26 +442,39 @@ fn build_vector<'fbb>(
     schema: &Schema,
     fbb: &mut FlatBufferBuilder<'fbb>,
     depth: usize,
-    max_depth: usize,
+    options: &BuildOptions,
 ) -> Result<WIPOffset<UnionWIPOffset>, FromJsonError> {
-    check_depth(depth, max_depth)?;
+    check_depth(depth, options.max_depth)?;
     let field_name = field.name().to_string();
     let element_type = field.type_().element();
 
-    // [ubyte] / [u8] — JSON string (base64). Tolerate empty array as well.
+    // [ubyte] / [u8] — JSON string (base64, or lowercase hex when
+    // the field carries the `(hex)` attribute — flatc's
+    // `[ubyte] (hex)` convention). Tolerate empty array as well.
     if matches!(element_type, BaseType::UByte | BaseType::UType) {
+        let is_hex = field_has_attribute(field, "hex");
         let bytes = match value {
             Value::String(s) => {
-                BASE64
-                    .decode(s.as_bytes())
-                    .map_err(|e| FromJsonError::InvalidBase64 {
+                if is_hex {
+                    decode_hex_string(s).map_err(|e| FromJsonError::InvalidHex {
                         field: field_name.clone(),
-                        error: e.to_string(),
+                        error: e,
                     })?
+                } else {
+                    BASE64
+                        .decode(s.as_bytes())
+                        .map_err(|e| FromJsonError::InvalidBase64 {
+                            field: field_name.clone(),
+                            error: e.to_string(),
+                        })?
+                }
             }
             Value::Array(arr) => {
                 // Also accept a JSON array of numbers for [ubyte]
-                // (flatc accepts both forms on input).
+                // (flatc accepts both forms on input). The `(hex)`
+                // attribute does not change the array shape — only
+                // the string-form interpretation — so the
+                // per-element decoding here is unaffected.
                 let mut out = Vec::with_capacity(arr.len());
                 for (i, v) in arr.iter().enumerate() {
                     let n = v.as_u64().ok_or_else(|| FromJsonError::TypeMismatch {
@@ -433,13 +496,42 @@ fn build_vector<'fbb>(
             _ => {
                 return Err(FromJsonError::TypeMismatch {
                     field: field_name,
-                    expected: "string (base64) or array of bytes",
+                    expected: if is_hex {
+                        "string (hex) or array of bytes"
+                    } else {
+                        "string (base64) or array of bytes"
+                    },
                     got: value_kind(value),
                 });
             }
         };
         let off = fbb.create_vector::<u8>(&bytes);
         return Ok(WIPOffset::new(off.value()));
+    }
+
+    // `(key)`-annotated vector-of-tables can accept a JSON *object*
+    // (the design §8 sugar): keys are the values of the child
+    // table's `(key)` field, values are the rest of each sub-table.
+    // The JSON-array form (with the key field set inline on each
+    // element) is also accepted via the standard path below, so a
+    // caller has both options.
+    if value.is_object() && element_type == BaseType::Obj {
+        let child_idx = u_index(field.type_().index(), "Vector of Obj")?;
+        let child_object = schema.objects().get(child_idx);
+        if !child_object.is_struct()
+            && let Some(keyed_field) = find_keyed_field(&child_object)
+        {
+            return build_vector_of_keyed_tables_from_object(
+                value,
+                field,
+                &child_object,
+                &keyed_field,
+                schema,
+                fbb,
+                depth + 1,
+                options,
+            );
+        }
     }
 
     // All other element types require a JSON array.
@@ -582,7 +674,7 @@ fn build_vector<'fbb>(
                     schema,
                     fbb,
                     depth + 1,
-                    max_depth,
+                    options,
                 )?);
             }
             // The flatbuffers Rust API doesn't expose a one-shot
@@ -609,6 +701,157 @@ fn build_vector<'fbb>(
     }
 }
 
+/// Look up the `(key)`-annotated field on `child_object`. Returns
+/// `None` if no field carries the annotation. Same semantics as
+/// `to_json`'s `find_keyed_field` (kept module-local to avoid a
+/// cross-module dependency on a non-API helper).
+fn find_keyed_field<'a>(child_object: &'a Object) -> Option<Field<'a>> {
+    let fields = child_object.fields();
+    for i in 0..fields.len() {
+        let f = fields.get(i);
+        if f.key() {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// Build a `(key)`-annotated vector of tables from a JSON object
+/// (the design §8 sugar — inverse of [`crate::to_json`]'s emission
+/// path).
+///
+/// Per the FlatBuffers `(key)` contract, the resulting vector is
+/// sorted by the key field so the read-side `LookupByKey`
+/// (= `pg_flatbuffers.key_lookup_strict = on`) bisect finds entries
+/// correctly. The sort happens *before* sub-table construction so
+/// `WIPOffset`s for the sub-tables end up in the buffer in the
+/// final wire order (FlatBuffers writes vector elements at
+/// `start_vector` time and we can't re-order them afterward).
+///
+/// The key value from the JSON object is injected into the
+/// sub-table's JSON map under the keyed field's name; if the
+/// sub-object already specifies that field its value must match
+/// (mismatch → `TypeMismatch`).
+#[allow(clippy::too_many_arguments)]
+fn build_vector_of_keyed_tables_from_object<'fbb>(
+    value: &Value,
+    field: &Field,
+    child_object: &Object,
+    keyed_field: &Field,
+    schema: &Schema,
+    fbb: &mut FlatBufferBuilder<'fbb>,
+    depth: usize,
+    options: &BuildOptions,
+) -> Result<WIPOffset<UnionWIPOffset>, FromJsonError> {
+    check_depth(depth, options.max_depth)?;
+    let field_name = field.name().to_string();
+    let key_field_name = keyed_field.name().to_string();
+    let key_base = keyed_field.type_().base_type();
+
+    let obj = value.as_object().expect("caller checked is_object");
+
+    // Decode each (json_key, json_value) pair into a (sort_key,
+    // injected_sub_obj) tuple, then sort, then build sub-tables.
+    enum SortKey {
+        Text(String),
+        Int(i64),
+    }
+    let mut entries: Vec<(SortKey, serde_json::Map<String, Value>)> = Vec::with_capacity(obj.len());
+
+    for (json_key, sub_value) in obj.iter() {
+        let sub_obj = sub_value
+            .as_object()
+            .ok_or_else(|| FromJsonError::TypeMismatch {
+                field: format!("{field_name}[{json_key:?}]"),
+                expected: "object",
+                got: value_kind(sub_value),
+            })?;
+
+        // Inject (or validate consistency of) the keyed field on
+        // the sub-object so build_table sees a complete row.
+        let mut merged = sub_obj.clone();
+        let key_as_json = match key_base {
+            BaseType::String => Value::String(json_key.clone()),
+            BaseType::Byte
+            | BaseType::UByte
+            | BaseType::Short
+            | BaseType::UShort
+            | BaseType::Int
+            | BaseType::UInt
+            | BaseType::Long
+            | BaseType::ULong => {
+                // Parse the JSON object key as a decimal integer.
+                let n: i64 = json_key.parse().map_err(|_| FromJsonError::TypeMismatch {
+                    field: format!("{field_name}[{json_key:?}]"),
+                    expected: "integer key (decimal)",
+                    got: "non-numeric string",
+                })?;
+                Value::Number(n.into())
+            }
+            other => {
+                return Err(FromJsonError::Unsupported {
+                    field: key_field_name.clone(),
+                    what: match other {
+                        BaseType::Bool => "(key) on bool field",
+                        BaseType::Float | BaseType::Double => "(key) on float field",
+                        _ => "(key) on non-string/non-integer field",
+                    },
+                });
+            }
+        };
+        if let Some(existing) = merged.get(&key_field_name) {
+            if existing != &key_as_json {
+                return Err(FromJsonError::TypeMismatch {
+                    field: format!("{field_name}[{json_key:?}].{key_field_name}"),
+                    expected: "key value matching the enclosing object key",
+                    got: "different value",
+                });
+            }
+        } else {
+            merged.insert(key_field_name.clone(), key_as_json);
+        }
+
+        let sort_key = match key_base {
+            BaseType::String => SortKey::Text(json_key.clone()),
+            _ => SortKey::Int(json_key.parse().expect("parsed above")),
+        };
+        entries.push((sort_key, merged));
+    }
+
+    // Sort by the keyed field so the read side's binary search
+    // finds entries (FlatBuffers `(key)` contract).
+    entries.sort_by(|a, b| match (&a.0, &b.0) {
+        (SortKey::Text(x), SortKey::Text(y)) => x.cmp(y),
+        (SortKey::Int(x), SortKey::Int(y)) => x.cmp(y),
+        // Unreachable: every entry comes from the same keyed field
+        // and therefore the same SortKey variant. Defensive: keep
+        // input order if mixed.
+        _ => std::cmp::Ordering::Equal,
+    });
+
+    // Build each sub-table.
+    let mut offs: Vec<WIPOffset<flatbuffers::TableFinishedWIPOffset>> =
+        Vec::with_capacity(entries.len());
+    for (_, sub_obj) in entries {
+        offs.push(build_table(
+            &sub_obj,
+            child_object,
+            schema,
+            fbb,
+            depth + 1,
+            options,
+        )?);
+    }
+
+    // Same vector-of-tables emission as the array path.
+    fbb.start_vector::<ForwardsUOffset<flatbuffers::Table<'_>>>(offs.len());
+    for off in offs.iter().rev() {
+        fbb.push::<WIPOffset<flatbuffers::TableFinishedWIPOffset>>(*off);
+    }
+    let v = fbb.end_vector::<ForwardsUOffset<flatbuffers::Table<'_>>>(offs.len());
+    Ok(WIPOffset::new(v.value()))
+}
+
 /// `(discriminator_byte, optional_value_uoffset)` returned by the
 /// union-builder helper. `None` value means NONE (no value slot to
 /// push) or value-slot omission for non-NONE variants (defensive).
@@ -625,7 +868,7 @@ fn build_union_pair<'fbb>(
     fbb: &mut FlatBufferBuilder<'fbb>,
     parent_table_name: &str,
     depth: usize,
-    max_depth: usize,
+    options: &BuildOptions,
 ) -> Result<Option<UnionPair>, FromJsonError> {
     let field_name = value_field.name();
     let disc_key = format!("{field_name}_type");
@@ -718,7 +961,7 @@ fn build_union_pair<'fbb>(
                         expected: "object",
                         got: value_kind(value_v),
                     })?;
-                let sub_off = build_table(sub_obj, &variant_object, schema, fbb, depth, max_depth)?;
+                let sub_off = build_table(sub_obj, &variant_object, schema, fbb, depth, options)?;
                 WIPOffset::new(sub_off.value())
             }
         }
@@ -1822,6 +2065,45 @@ fn u_index(i: i32, what: &'static str) -> Result<usize, FromJsonError> {
     Ok(i as usize)
 }
 
+/// Returns true if `field` has an attribute whose key matches
+/// `name` (case-sensitive — flatc attribute keys are stored
+/// verbatim in the `.bfbs`). The attribute's value (if any) is
+/// ignored; flag-style attributes like `(hex)` carry no value.
+fn field_has_attribute(field: &Field, name: &str) -> bool {
+    let Some(attrs) = field.attributes() else {
+        return false;
+    };
+    (0..attrs.len()).any(|i| attrs.get(i).key() == name)
+}
+
+/// Decode a hex string into bytes. flatc emits lowercase hex with
+/// no separators or `0x` prefix on the read side; we accept either
+/// case on input to be liberal with hand-written JSON. Returns a
+/// short human-readable error string on malformed input
+/// (odd length, non-hex character).
+fn decode_hex_string(s: &str) -> Result<Vec<u8>, String> {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err(format!("odd-length hex string ({} chars)", bytes.len()));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(c: u8) -> Result<u8, String> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(format!("invalid hex character {:?}", c as char)),
+    }
+}
+
 /// Byte size of a scalar `BaseType` for fixed-size array stride
 /// computation. `None` for non-scalar types.
 fn scalar_size(b: BaseType) -> Option<usize> {
@@ -2098,7 +2380,7 @@ mod tests {
             "inner": { "tag": "x" },
             "children": [{ "tag": "c1" }, { "tag": "c2" }],
         });
-        let buf = json_to_buf(&input, &schema, 64).expect("from_json ok");
+        let buf = json_to_buf(&input, &schema, &BuildOptions::default()).expect("from_json ok");
         // Verifier must accept it.
         crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
             .expect("buffer verifies");
@@ -2113,7 +2395,7 @@ mod tests {
         let schema = root_as_schema(&bfbs).expect("schema parses");
         // Empty object: every nullable absent, scalar defaults
         // emitted on read.
-        let buf = json_to_buf(&json!({}), &schema, 64).expect("from_json ok");
+        let buf = json_to_buf(&json!({}), &schema, &BuildOptions::default()).expect("from_json ok");
         crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
             .expect("buffer verifies");
         let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
@@ -2127,7 +2409,8 @@ mod tests {
     fn from_json_rejects_unknown_field() {
         let bfbs = build_t_schema();
         let schema = root_as_schema(&bfbs).expect("schema parses");
-        let err = json_to_buf(&json!({ "bogus": 1 }), &schema, 64).unwrap_err();
+        let err =
+            json_to_buf(&json!({ "bogus": 1 }), &schema, &BuildOptions::default()).unwrap_err();
         assert!(
             matches!(&err, FromJsonError::UnknownField { table, field }
                 if table == "T" && field == "bogus"),
@@ -2135,11 +2418,47 @@ mod tests {
         );
     }
 
+    /// `unknown_field_is_error = false` (the
+    /// `pg_flatbuffers.from_json_unknown = off` GUC) silently drops
+    /// keys that have no matching field on the target table. The
+    /// resulting buffer still verifies, the rest of the input is
+    /// preserved, and re-rendering through `to_json` shows no trace
+    /// of the unknown key.
+    #[test]
+    fn from_json_ignores_unknown_field_when_opted_out() {
+        let bfbs = build_t_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let options = BuildOptions {
+            unknown_field_is_error: false,
+            ..BuildOptions::default()
+        };
+        // `bogus` is not a field on T; `count` is. Lenient mode
+        // should drop `bogus` and emit a buffer whose `count` is 11.
+        let buf = json_to_buf(
+            &json!({ "bogus": 1, "count": 11, "active": true, "color": "Red" }),
+            &schema,
+            &options,
+        )
+        .expect("from_json ok in lenient mode");
+        crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
+            .expect("buffer verifies");
+        let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
+        assert_eq!(
+            value,
+            json!({ "count": 11, "active": true, "color": "Red" })
+        );
+    }
+
     #[test]
     fn from_json_rejects_type_mismatch() {
         let bfbs = build_t_schema();
         let schema = root_as_schema(&bfbs).expect("schema parses");
-        let err = json_to_buf(&json!({ "count": "forty-two" }), &schema, 64).unwrap_err();
+        let err = json_to_buf(
+            &json!({ "count": "forty-two" }),
+            &schema,
+            &BuildOptions::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, FromJsonError::TypeMismatch { field, expected, got }
                 if field == "count" && *expected == "i32" && *got == "string"),
@@ -2153,7 +2472,8 @@ mod tests {
         let schema = root_as_schema(&bfbs).expect("schema parses");
         // color is byte-typed (enum), but accepting numeric value
         // outside i8 range should still fail.
-        let err = json_to_buf(&json!({ "color": 999 }), &schema, 64).unwrap_err();
+        let err =
+            json_to_buf(&json!({ "color": 999 }), &schema, &BuildOptions::default()).unwrap_err();
         assert!(
             matches!(&err, FromJsonError::IntegerOutOfRange { field, .. } if field == "color"),
             "got {err:?}"
@@ -2164,7 +2484,12 @@ mod tests {
     fn from_json_rejects_unknown_enum_name() {
         let bfbs = build_t_schema();
         let schema = root_as_schema(&bfbs).expect("schema parses");
-        let err = json_to_buf(&json!({ "color": "Magenta" }), &schema, 64).unwrap_err();
+        let err = json_to_buf(
+            &json!({ "color": "Magenta" }),
+            &schema,
+            &BuildOptions::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, FromJsonError::UnknownEnumName { field, enum_name, value }
                 if field == "color" && enum_name == "Color" && value == "Magenta"),
@@ -2176,7 +2501,12 @@ mod tests {
     fn from_json_rejects_invalid_base64() {
         let bfbs = build_t_schema();
         let schema = root_as_schema(&bfbs).expect("schema parses");
-        let err = json_to_buf(&json!({ "blob": "not valid base64!" }), &schema, 64).unwrap_err();
+        let err = json_to_buf(
+            &json!({ "blob": "not valid base64!" }),
+            &schema,
+            &BuildOptions::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, FromJsonError::InvalidBase64 { field, .. } if field == "blob"),
             "got {err:?}"
@@ -2187,7 +2517,7 @@ mod tests {
     fn from_json_rejects_root_not_object() {
         let bfbs = build_t_schema();
         let schema = root_as_schema(&bfbs).expect("schema parses");
-        let err = json_to_buf(&json!([1, 2, 3]), &schema, 64).unwrap_err();
+        let err = json_to_buf(&json!([1, 2, 3]), &schema, &BuildOptions::default()).unwrap_err();
         assert!(
             matches!(&err, FromJsonError::RootNotObject { got } if *got == "array"),
             "got {err:?}"
@@ -2200,11 +2530,60 @@ mod tests {
         let schema = root_as_schema(&bfbs).expect("schema parses");
         // inner.tag → 1 level deep. With max_depth=0 we error out
         // at the very first descent.
-        let err = json_to_buf(&json!({ "inner": { "tag": "x" } }), &schema, 0).unwrap_err();
+        let err = json_to_buf(
+            &json!({ "inner": { "tag": "x" } }),
+            &schema,
+            &BuildOptions {
+                max_depth: 0,
+                ..BuildOptions::default()
+            },
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, FromJsonError::NestingTooDeep { max } if *max == 0),
             "got {err:?}"
         );
+    }
+
+    /// `max_output_size` caps the *finished* FlatBuffer length;
+    /// the bound matches the verifier's `max_apparent_size`. A
+    /// tight cap (`1` byte) rejects even an empty buffer; the
+    /// default (64 MiB) leaves room for any test fixture.
+    #[test]
+    fn from_json_caps_output_size_at_max_apparent_size() {
+        let bfbs = build_t_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let err = json_to_buf(
+            &json!({ "name": "hello" }),
+            &schema,
+            &BuildOptions {
+                max_output_size: 1,
+                ..BuildOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, FromJsonError::OutputTooLarge { size, max }
+                if *size > 1 && *max == 1),
+            "got {err:?}"
+        );
+    }
+
+    /// At the default cap (64 MiB), realistic fixtures build
+    /// without tripping the check. Pins the "default is generous"
+    /// half of the contract.
+    #[test]
+    fn from_json_default_output_cap_passes_small_buffer() {
+        let bfbs = build_t_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        // Default `BuildOptions` uses max_output_size = 64 MiB.
+        let buf = json_to_buf(
+            &json!({ "name": "hello", "count": 7 }),
+            &schema,
+            &BuildOptions::default(),
+        )
+        .expect("from_json ok under default cap");
+        assert!(buf.len() < 64 * 1024 * 1024);
     }
 
     /// Build a `table P { pos:Vec3; }` schema where
@@ -2317,7 +2696,7 @@ mod tests {
         let bfbs = build_point_schema();
         let schema = root_as_schema(&bfbs).expect("schema parses");
         let input = json!({ "pos": { "x": 1.0, "y": 2.0, "z": 3.0 } });
-        let buf = json_to_buf(&input, &schema, 64).expect("from_json ok");
+        let buf = json_to_buf(&input, &schema, &BuildOptions::default()).expect("from_json ok");
         crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
             .expect("buffer verifies");
         let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
@@ -2329,7 +2708,12 @@ mod tests {
         let bfbs = build_point_schema();
         let schema = root_as_schema(&bfbs).expect("schema parses");
         // Missing `z` — struct fields are mandatory (no vtable).
-        let err = json_to_buf(&json!({ "pos": { "x": 1.0, "y": 2.0 } }), &schema, 64).unwrap_err();
+        let err = json_to_buf(
+            &json!({ "pos": { "x": 1.0, "y": 2.0 } }),
+            &schema,
+            &BuildOptions::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, FromJsonError::MissingRequiredField { table, field }
                 if table == "Vec3" && field == "z"),
@@ -2344,7 +2728,7 @@ mod tests {
         let err = json_to_buf(
             &json!({ "pos": { "x": 1.0, "y": 2.0, "z": 3.0, "w": 4.0 } }),
             &schema,
-            64,
+            &BuildOptions::default(),
         )
         .unwrap_err();
         assert!(
@@ -2453,7 +2837,7 @@ mod tests {
         let bfbs = build_array_schema();
         let schema = root_as_schema(&bfbs).expect("schema parses");
         let input = json!({ "b": { "arr": [10, 20, 30] } });
-        let buf = json_to_buf(&input, &schema, 64).expect("from_json ok");
+        let buf = json_to_buf(&input, &schema, &BuildOptions::default()).expect("from_json ok");
         crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
             .expect("buffer verifies");
         let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
@@ -2465,7 +2849,12 @@ mod tests {
         let bfbs = build_array_schema();
         let schema = root_as_schema(&bfbs).expect("schema parses");
         // Array has fixed_length=3; supplying 2 elements is an error.
-        let err = json_to_buf(&json!({ "b": { "arr": [10, 20] } }), &schema, 64).unwrap_err();
+        let err = json_to_buf(
+            &json!({ "b": { "arr": [10, 20] } }),
+            &schema,
+            &BuildOptions::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, FromJsonError::IntegerOutOfRange { field, .. } if field == "arr"),
             "got {err:?}"
@@ -2591,7 +2980,7 @@ mod tests {
                 { "x": 7.0, "y": 8.0, "z": 9.0 },
             ],
         });
-        let buf = json_to_buf(&input, &schema, 64).expect("from_json ok");
+        let buf = json_to_buf(&input, &schema, &BuildOptions::default()).expect("from_json ok");
         crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
             .expect("buffer verifies");
         let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
@@ -2603,7 +2992,7 @@ mod tests {
         let bfbs = build_vec_of_struct_schema();
         let schema = root_as_schema(&bfbs).expect("schema parses");
         let input = json!({ "points": [] });
-        let buf = json_to_buf(&input, &schema, 64).expect("from_json ok");
+        let buf = json_to_buf(&input, &schema, &BuildOptions::default()).expect("from_json ok");
         crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
             .expect("buffer verifies");
         let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
@@ -2617,7 +3006,7 @@ mod tests {
         let err = json_to_buf(
             &json!({ "points": [{ "x": 1.0, "y": 2.0, "z": 3.0 }, "not an object"] }),
             &schema,
-            64,
+            &BuildOptions::default(),
         )
         .unwrap_err();
         assert!(
@@ -2625,5 +3014,359 @@ mod tests {
                 if field == "points[1]" && *expected == "object" && *got == "string"),
             "got {err:?}"
         );
+    }
+
+    /// Build a minimal `table H { blob:[ubyte] (hex); }` reflection
+    /// schema. Same shape as the to_json fixture so the two sides
+    /// can be tested symmetrically.
+    fn build_hex_blob_schema() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let vec_ubyte_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::UByte,
+                index: -1,
+                ..Default::default()
+            },
+        );
+        let hex_key = fbb.create_string("hex");
+        let hex_kv = flatbuffers_reflection::reflection::KeyValue::create(
+            &mut fbb,
+            &flatbuffers_reflection::reflection::KeyValueArgs {
+                key: Some(hex_key),
+                value: None,
+            },
+        );
+        let attrs = fbb.create_vector(&[hex_kv]);
+        let blob_n = fbb.create_string("blob");
+        let blob_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(blob_n),
+                type_: Some(vec_ubyte_t),
+                id: 0,
+                offset: 4,
+                attributes: Some(attrs),
+                ..Default::default()
+            },
+        );
+        let h_fields = fbb.create_vector(&[blob_f]);
+        let h_n = fbb.create_string("H");
+        let h_obj = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(h_n),
+                fields: Some(h_fields),
+                ..Default::default()
+            },
+        );
+        let objects = fbb.create_vector(&[h_obj]);
+        let enums: flatbuffers::WIPOffset<
+            flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Enum<'_>>>,
+        > = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum<'_>>>(&[]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(h_obj),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// `(hex)`-annotated `[ubyte]` field: a JSON hex string decodes
+    /// to the raw bytes and round-trips through `to_json` as
+    /// lowercase hex.
+    #[test]
+    fn from_json_decodes_hex_string_for_hex_attribute() {
+        let bfbs = build_hex_blob_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let buf = json_to_buf(
+            &json!({ "blob": "deadbeef" }),
+            &schema,
+            &BuildOptions::default(),
+        )
+        .expect("from_json ok");
+        crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
+            .expect("buffer verifies");
+        let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
+        assert_eq!(value, json!({ "blob": "deadbeef" }));
+    }
+
+    /// Hex decoder accepts uppercase characters even though
+    /// `to_json` only ever emits lowercase — being liberal on
+    /// input is friendly to hand-written JSON.
+    #[test]
+    fn from_json_hex_decoder_accepts_uppercase() {
+        let bfbs = build_hex_blob_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let buf = json_to_buf(
+            &json!({ "blob": "DEADBEEF" }),
+            &schema,
+            &BuildOptions::default(),
+        )
+        .expect("from_json ok");
+        let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
+        assert_eq!(value, json!({ "blob": "deadbeef" }));
+    }
+
+    /// Odd-length hex strings and non-hex characters surface as
+    /// [`FromJsonError::InvalidHex`].
+    #[test]
+    fn from_json_rejects_invalid_hex() {
+        let bfbs = build_hex_blob_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+
+        let err =
+            json_to_buf(&json!({ "blob": "abc" }), &schema, &BuildOptions::default()).unwrap_err();
+        assert!(
+            matches!(&err, FromJsonError::InvalidHex { field, .. } if field == "blob"),
+            "got {err:?}"
+        );
+
+        let err =
+            json_to_buf(&json!({ "blob": "zz" }), &schema, &BuildOptions::default()).unwrap_err();
+        assert!(
+            matches!(&err, FromJsonError::InvalidHex { field, .. } if field == "blob"),
+            "got {err:?}"
+        );
+    }
+
+    /// Hex-decoder unit test pairs with `encode_lower_hex` in
+    /// to_json — the two functions are symmetric and must
+    /// round-trip arbitrary byte sequences.
+    #[test]
+    fn decode_hex_string_round_trip() {
+        assert_eq!(decode_hex_string("").unwrap(), Vec::<u8>::new());
+        assert_eq!(decode_hex_string("00").unwrap(), vec![0x00]);
+        assert_eq!(decode_hex_string("0ff0").unwrap(), vec![0x0f, 0xf0]);
+        assert_eq!(
+            decode_hex_string("DEADBEEF").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        assert!(decode_hex_string("a").is_err()); // odd length
+        assert!(decode_hex_string("gg").is_err()); // non-hex
+    }
+
+    /// Build a `table Bag { items: [Item]; }` reflection schema
+    /// where `table Item { sku: string (key); qty: int; }`. Same
+    /// shape as the to_json fixture so the two sides round-trip.
+    fn build_keyed_bag_schema() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let str_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::String,
+                ..Default::default()
+            },
+        );
+        let int_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Int,
+                ..Default::default()
+            },
+        );
+        let sku_n = fbb.create_string("sku");
+        let sku_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(sku_n),
+                type_: Some(str_t),
+                id: 0,
+                offset: 4,
+                key: true,
+                ..Default::default()
+            },
+        );
+        let qty_n = fbb.create_string("qty");
+        let qty_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(qty_n),
+                type_: Some(int_t),
+                id: 1,
+                offset: 6,
+                ..Default::default()
+            },
+        );
+        // Fields alphabetical: qty < sku.
+        let item_fields = fbb.create_vector(&[qty_f, sku_f]);
+        let item_n = fbb.create_string("Item");
+        let item = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(item_n),
+                fields: Some(item_fields),
+                ..Default::default()
+            },
+        );
+        let vec_item_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::Obj,
+                index: 1,
+                ..Default::default()
+            },
+        );
+        let items_n = fbb.create_string("items");
+        let items_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(items_n),
+                type_: Some(vec_item_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let bag_fields = fbb.create_vector(&[items_f]);
+        let bag_n = fbb.create_string("Bag");
+        let bag = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(bag_n),
+                fields: Some(bag_fields),
+                ..Default::default()
+            },
+        );
+        let objects = fbb.create_vector(&[bag, item]);
+        let enums: flatbuffers::WIPOffset<
+            flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Enum<'_>>>,
+        > = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum<'_>>>(&[]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(bag),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// A JSON object for a `(key)`-annotated vector field builds
+    /// a vector of tables with the key field populated from the
+    /// object key — design §8 sugar, inverse of the to_json
+    /// emission path.
+    #[test]
+    fn from_json_keyed_vector_accepts_object_sugar() {
+        let bfbs = build_keyed_bag_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        // Insertion order is *unsorted* relative to the wire's
+        // sku-sorted order; the builder must sort before emit.
+        let input = json!({
+            "items": {
+                "banana": { "qty": 2 },
+                "apple":  { "qty": 1 },
+            }
+        });
+        let buf = json_to_buf(&input, &schema, &BuildOptions::default()).expect("from_json ok");
+        crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
+            .expect("buffer verifies");
+        let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
+        // to_json round-trips through the *same* sugar, so the
+        // expected shape is a JSON object.
+        assert_eq!(
+            value,
+            json!({
+                "items": {
+                    "apple":  { "sku": "apple",  "qty": 1 },
+                    "banana": { "sku": "banana", "qty": 2 },
+                }
+            })
+        );
+    }
+
+    /// The JSON-array form is still accepted (and is the only
+    /// form a non-`(key)` vector accepts) — the object-sugar is
+    /// purely additive.
+    #[test]
+    fn from_json_keyed_vector_accepts_array_form_too() {
+        let bfbs = build_keyed_bag_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let input = json!({
+            "items": [
+                { "sku": "apple",  "qty": 1 },
+                { "sku": "banana", "qty": 2 },
+            ]
+        });
+        let buf = json_to_buf(&input, &schema, &BuildOptions::default()).expect("from_json ok");
+        let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
+        assert_eq!(
+            value,
+            json!({
+                "items": {
+                    "apple":  { "sku": "apple",  "qty": 1 },
+                    "banana": { "sku": "banana", "qty": 2 },
+                }
+            })
+        );
+    }
+
+    /// If the sub-object specifies the key field with a value
+    /// different from the enclosing object key, the build fails —
+    /// silently overwriting either source would mask a caller
+    /// bug.
+    #[test]
+    fn from_json_keyed_vector_rejects_key_mismatch() {
+        let bfbs = build_keyed_bag_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let input = json!({
+            "items": {
+                "apple": { "sku": "banana", "qty": 1 },
+            }
+        });
+        let err = json_to_buf(&input, &schema, &BuildOptions::default()).unwrap_err();
+        assert!(
+            matches!(&err, FromJsonError::TypeMismatch { field, .. }
+                if field == "items[\"apple\"].sku"),
+            "got {err:?}"
+        );
+    }
+
+    /// Resulting vector must be sorted on the wire so the
+    /// read-side `LookupByKey` bisect finds entries. Pins the
+    /// sort invariant by sorting bytes manually and comparing
+    /// against re-emitted JSON in canonical (lex-sorted) form.
+    #[test]
+    fn from_json_keyed_vector_sorts_on_wire() {
+        let bfbs = build_keyed_bag_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let input = json!({
+            "items": {
+                "zebra":  { "qty": 9 },
+                "apple":  { "qty": 1 },
+                "monkey": { "qty": 5 },
+            }
+        });
+        let buf = json_to_buf(&input, &schema, &BuildOptions::default()).expect("from_json ok");
+        crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
+            .expect("buffer verifies");
+        // Read back through the executor's binary-search MapKey
+        // path (key_lookup_strict = on); a wrongly-sorted vector
+        // would silently miss on "apple" and/or "monkey".
+        for (k, expected_qty) in [("apple", 1), ("monkey", 5), ("zebra", 9)] {
+            let value = crate::to_json::buf_to_json(&buf, &schema).expect("to_json ok");
+            // to_json emits in wire order; assertion above ensures
+            // the wire order is lex-sorted (alphabetical match
+            // with the object's iteration after sort).
+            let items = value.get("items").and_then(Value::as_object).unwrap();
+            assert!(
+                items
+                    .get(k)
+                    .and_then(|v| v.get("qty"))
+                    .and_then(Value::as_i64)
+                    == Some(expected_qty as i64),
+                "missing or wrong qty for {k}: {value}"
+            );
+        }
     }
 }

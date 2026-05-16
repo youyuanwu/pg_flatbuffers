@@ -13,19 +13,15 @@
 //! | `bool` | JSON boolean |
 //! | enum (non-union) | JSON string (member name); JSON number if the value is unknown |
 //! | `string` | JSON string (UTF-8) |
-//! | `[ubyte]` / `[u8]` | JSON string, base64-encoded (no `(hex)` attribute support yet) |
+//! | `[ubyte]` / `[u8]` | JSON string, base64-encoded (lowercase hex if the field carries the `(hex)` attribute, per flatc) |
 //! | `[T]` for other `T` | JSON array |
 //! | table / struct | JSON object |
+//! | vector of `(key)`-annotated tables | JSON object keyed by the `(key)` field's stringified value |
 //! | union | flatc-style sibling field pair: `<name>_type` (string) + `<name>` (value) |
 //! | fixed-size array | JSON array |
 //!
 //! ## Deferred (still rejected with [`ToJsonError::Unsupported`]):
 //!
-//! - Vector of `(key)`-annotated tables → JSON object keyed by the
-//!   key field (would compose cleanly with PG's `jsonb` operators but
-//!   not essential for round-trip parity).
-//! - `(hex)` attribute on `[ubyte]` → lowercase hex string instead of
-//!   base64.
 //! - Vector of unions — already rejected at the *schema* level in
 //!   [`crate::verify::reject_unsupported_schema_features`].
 //! - Vector64 — same.
@@ -348,20 +344,28 @@ fn array_to_json(
 
 /// Render a vector field (anything matching `BaseType::Vector`) as a
 /// JSON array — except `[ubyte]` / `[u8]`, which is base64-encoded
+/// (or lowercase-hex when the field carries the `(hex)` attribute)
 /// per design §8.
 fn vector_to_json(table: &Table, field: &Field, schema: &Schema) -> Result<Value, ToJsonError> {
     let element_type = field.type_().element();
     let name = field.name().to_string();
 
-    // [ubyte] / [u8]: base64-encoded JSON string. (`(hex)` attribute
-    // honoring is a deferred sub-slice.)
+    // [ubyte] / [u8]: JSON string, base64 by default, lowercase hex
+    // when `(hex)` is set on the field (matches flatc's
+    // `(hex)`/`hashed` convention).
     if matches!(element_type, BaseType::UByte | BaseType::UType) {
         // SAFETY: caller verified.
         let v = unsafe { table.get::<ForwardsUOffset<Vector<u8>>>(field.offset(), None) };
-        return Ok(match v {
-            Some(vec) => Value::String(BASE64.encode(vec.bytes())),
-            None => Value::Array(Vec::new()),
-        });
+        let bytes: &[u8] = match v {
+            Some(vec) => vec.bytes(),
+            None => return Ok(Value::Array(Vec::new())),
+        };
+        let encoded = if field_has_attribute(field, "hex") {
+            encode_lower_hex(bytes)
+        } else {
+            BASE64.encode(bytes)
+        };
+        return Ok(Value::String(encoded));
     }
 
     // [bool]: vector of booleans.
@@ -440,16 +444,48 @@ fn vector_to_json(table: &Table, field: &Field, schema: &Schema) -> Result<Value
                         None,
                     )
                 };
-                Ok(match v {
-                    Some(vec) => {
-                        let mut out = Vec::with_capacity(vec.len());
-                        for i in 0..vec.len() {
-                            out.push(table_to_json(&vec.get(i), &child_object, schema)?);
-                        }
-                        Value::Array(out)
+                let vec = match v {
+                    Some(vec) => vec,
+                    None => {
+                        // Absent vector: object-shape if the child
+                        // has a `(key)` field (empty object), array
+                        // otherwise — mirrors the populated path.
+                        return Ok(if find_keyed_field(&child_object).is_some() {
+                            Value::Object(Map::new())
+                        } else {
+                            Value::Array(Vec::new())
+                        });
                     }
-                    None => Value::Array(Vec::new()),
-                })
+                };
+                // `(key)`-annotated child → JSON object keyed by the
+                // key field's stringified value (design §8 sugar).
+                // Iteration is in wire order so consecutive equal
+                // keys (malformed vectors that the verifier doesn't
+                // yet reject) collapse with last-write-wins; the
+                // object form makes that visible rather than hiding
+                // it in array indices.
+                if let Some(keyed_field) = find_keyed_field(&child_object) {
+                    let mut map = Map::new();
+                    for i in 0..vec.len() {
+                        let elem = vec.get(i);
+                        // SAFETY: caller verified.
+                        let key = unsafe {
+                            flatbuffers_reflection::get_any_field_string(
+                                &elem,
+                                &keyed_field,
+                                schema,
+                            )
+                        };
+                        let body = table_to_json(&elem, &child_object, schema)?;
+                        map.insert(key, body);
+                    }
+                    return Ok(Value::Object(map));
+                }
+                let mut out = Vec::with_capacity(vec.len());
+                for i in 0..vec.len() {
+                    out.push(table_to_json(&vec.get(i), &child_object, schema)?);
+                }
+                Ok(Value::Array(out))
             }
         }
         BaseType::Union => Err(ToJsonError::Internal(format!(
@@ -877,6 +913,50 @@ fn u_index(i: i32, what: &'static str) -> Result<usize, ToJsonError> {
         return Err(ToJsonError::Internal(format!("{what} is negative ({i})")));
     }
     Ok(i as usize)
+}
+
+/// Returns true if `field` has an attribute whose key matches
+/// `name` (case-sensitive; flatc attribute keys are stored verbatim
+/// in the `.bfbs`). The attribute's value (if any) is ignored —
+/// flatc's flag-style attributes like `(hex)`, `(required)`, and
+/// `(key)` carry no value, and the reflection encoding stores them
+/// as a `KeyValue` with the key set and an empty/absent value.
+fn field_has_attribute(field: &Field, name: &str) -> bool {
+    let Some(attrs) = field.attributes() else {
+        return false;
+    };
+    (0..attrs.len()).any(|i| attrs.get(i).key() == name)
+}
+
+/// Look up the `(key)`-annotated field on a child table, used to
+/// drive the design §8 "vector of `(key)`-annotated tables → JSON
+/// object" sugar. FlatBuffers / flatc enforce at most one `(key)`
+/// field per table at schema-compile time; we still walk all
+/// fields rather than relying on that invariant. Returns `None`
+/// for plain tables (the caller falls back to the JSON-array
+/// rendering).
+fn find_keyed_field<'a>(child_object: &'a Object) -> Option<Field<'a>> {
+    let fields = child_object.fields();
+    for i in 0..fields.len() {
+        let f = fields.get(i);
+        if f.key() {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// Encode `bytes` as a lowercase hexadecimal string with no
+/// separators or `0x` prefix — flatc's `(hex)` convention for
+/// `[ubyte]` fields.
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn scalar_size(b: BaseType) -> Option<usize> {
@@ -1311,5 +1391,307 @@ mod tests {
                 if field == "ratio" && value == "-Infinity"),
             "got {err:?}"
         );
+    }
+
+    /// Build a minimal `table H { blob:[ubyte] (hex); }` reflection
+    /// schema. The `(hex)` attribute on `blob` is wired as a
+    /// `KeyValue { key: "hex" }` entry on the field's
+    /// `attributes` slot — matches what `flatc -b --schema` emits
+    /// for an `.fbs` containing `blob:[ubyte] (hex);`.
+    fn build_hex_blob_schema() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let ubyte_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::UByte,
+                ..Default::default()
+            },
+        );
+        let vec_ubyte_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::UByte,
+                index: -1,
+                ..Default::default()
+            },
+        );
+        let _ = ubyte_t;
+        // attributes: [ KeyValue { key: "hex" } ]
+        let hex_key = fbb.create_string("hex");
+        let hex_kv = flatbuffers_reflection::reflection::KeyValue::create(
+            &mut fbb,
+            &flatbuffers_reflection::reflection::KeyValueArgs {
+                key: Some(hex_key),
+                value: None,
+            },
+        );
+        let attrs = fbb.create_vector(&[hex_kv]);
+        let blob_n = fbb.create_string("blob");
+        let blob_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(blob_n),
+                type_: Some(vec_ubyte_t),
+                id: 0,
+                offset: 4,
+                attributes: Some(attrs),
+                ..Default::default()
+            },
+        );
+        let h_fields = fbb.create_vector(&[blob_f]);
+        let h_n = fbb.create_string("H");
+        let h_obj = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(h_n),
+                fields: Some(h_fields),
+                ..Default::default()
+            },
+        );
+        let objects = fbb.create_vector(&[h_obj]);
+        let enums: flatbuffers::WIPOffset<
+            flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Enum<'_>>>,
+        > = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum<'_>>>(&[]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(h_obj),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// A `[ubyte]` field carrying the `(hex)` attribute renders as
+    /// a lowercase hex string (no `0x` prefix, no separators) —
+    /// matches `flatc --strict-json` output for `(hex)`-annotated
+    /// fields.
+    #[test]
+    fn to_json_renders_hex_attribute_as_lowercase_hex_string() {
+        let bfbs = build_hex_blob_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+
+        // Build a buffer with blob = [0xDE, 0xAD, 0xBE, 0xEF].
+        let mut fbb = FlatBufferBuilder::new();
+        let blob_off = fbb.create_vector::<u8>(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let t = fbb.start_table();
+        fbb.push_slot_always(4, blob_off);
+        let root = fbb.end_table(t);
+        fbb.finish_minimal(root);
+        let buf = fbb.finished_data().to_vec();
+
+        crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
+            .expect("buffer verifies");
+        let value = buf_to_json(&buf, &schema).expect("to_json ok");
+        assert_eq!(value, json!({ "blob": "deadbeef" }));
+    }
+
+    /// `field_has_attribute` is the lookup that drives `(hex)`
+    /// dispatch (and is reusable for future flag-style attribute
+    /// honoring). Pins case-sensitive match + absent-attributes
+    /// short-circuit.
+    #[test]
+    fn field_has_attribute_lookup() {
+        let bfbs = build_hex_blob_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let blob = schema.root_table().unwrap().fields().get(0);
+        assert!(field_has_attribute(&blob, "hex"));
+        assert!(!field_has_attribute(&blob, "Hex")); // case-sensitive
+        assert!(!field_has_attribute(&blob, "key"));
+    }
+
+    /// Lowercase-hex encoder is the symmetric inverse of
+    /// [`crate::from_json::decode_hex_string`]; round-tripping
+    /// arbitrary bytes through it must produce the same bytes.
+    #[test]
+    fn encode_lower_hex_zero_padded() {
+        assert_eq!(encode_lower_hex(&[]), "");
+        assert_eq!(encode_lower_hex(&[0x00]), "00");
+        assert_eq!(encode_lower_hex(&[0x0f, 0xf0]), "0ff0");
+        assert_eq!(encode_lower_hex(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    /// Build a `table Bag { items: [Item]; }` reflection schema
+    /// where `table Item { sku: string (key); qty: int; }`. Used
+    /// for the `(key)`-vector → JSON object sugar tests in both
+    /// directions.
+    fn build_keyed_bag_schema() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let str_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::String,
+                ..Default::default()
+            },
+        );
+        let int_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Int,
+                ..Default::default()
+            },
+        );
+
+        // Item.sku: string (key)
+        let sku_n = fbb.create_string("sku");
+        let sku_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(sku_n),
+                type_: Some(str_t),
+                id: 0,
+                offset: 4,
+                key: true,
+                ..Default::default()
+            },
+        );
+        // Item.qty: int
+        let qty_n = fbb.create_string("qty");
+        let qty_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(qty_n),
+                type_: Some(int_t),
+                id: 1,
+                offset: 6,
+                ..Default::default()
+            },
+        );
+        // Fields alphabetical: qty < sku.
+        let item_fields = fbb.create_vector(&[qty_f, sku_f]);
+        let item_n = fbb.create_string("Item");
+        let item = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(item_n),
+                fields: Some(item_fields),
+                ..Default::default()
+            },
+        );
+
+        // Bag.items: [Item] (object index 1 once sorted: Bag, Item)
+        let vec_item_t = Type::create(
+            &mut fbb,
+            &TypeArgs {
+                base_type: BaseType::Vector,
+                element: BaseType::Obj,
+                index: 1,
+                ..Default::default()
+            },
+        );
+        let items_n = fbb.create_string("items");
+        let items_f = RField::create(
+            &mut fbb,
+            &FieldArgs {
+                name: Some(items_n),
+                type_: Some(vec_item_t),
+                id: 0,
+                offset: 4,
+                ..Default::default()
+            },
+        );
+        let bag_fields = fbb.create_vector(&[items_f]);
+        let bag_n = fbb.create_string("Bag");
+        let bag = RObject::create(
+            &mut fbb,
+            &ObjectArgs {
+                name: Some(bag_n),
+                fields: Some(bag_fields),
+                ..Default::default()
+            },
+        );
+        let objects = fbb.create_vector(&[bag, item]);
+        let enums: flatbuffers::WIPOffset<
+            flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Enum<'_>>>,
+        > = fbb.create_vector::<flatbuffers::ForwardsUOffset<Enum<'_>>>(&[]);
+        let schema = RSchema::create(
+            &mut fbb,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                root_table: Some(bag),
+                ..Default::default()
+            },
+        );
+        fbb.finish(schema, None);
+        fbb.finished_data().to_vec()
+    }
+
+    /// Build a `Bag` populated with two `Item` entries, in
+    /// sku-sorted wire order. The reader-side (key) bisect is the
+    /// usual consumer of this shape.
+    fn build_keyed_bag_buf() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        // Sorted by sku: "apple" < "banana".
+        let sku0 = fbb.create_string("apple");
+        let it0 = {
+            let t = fbb.start_table();
+            fbb.push_slot_always(4, sku0);
+            fbb.push_slot::<i32>(6, 1, 0);
+            fbb.end_table(t)
+        };
+        let sku1 = fbb.create_string("banana");
+        let it1 = {
+            let t = fbb.start_table();
+            fbb.push_slot_always(4, sku1);
+            fbb.push_slot::<i32>(6, 2, 0);
+            fbb.end_table(t)
+        };
+        let items = fbb.create_vector(&[it0, it1]);
+        let bag = {
+            let t = fbb.start_table();
+            fbb.push_slot_always(4, items);
+            fbb.end_table(t)
+        };
+        fbb.finish_minimal(bag);
+        fbb.finished_data().to_vec()
+    }
+
+    /// A `(key)`-annotated vector of tables renders as a JSON
+    /// *object* keyed by the key field's stringified value, with
+    /// each entry's body rendered as the rest of the table —
+    /// matches design §8.
+    #[test]
+    fn to_json_keyed_vector_emits_object_sugar() {
+        let bfbs = build_keyed_bag_schema();
+        let buf = build_keyed_bag_buf();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        crate::verify::verify(&buf, &schema, &crate::verify::Bounds::default())
+            .expect("buffer verifies");
+        let value = buf_to_json(&buf, &schema).expect("to_json ok");
+        // Note: each entry still carries its `sku` so the JSON is
+        // unambiguous when decoded by a consumer that doesn't know
+        // about the sugar.
+        assert_eq!(
+            value,
+            json!({
+                "items": {
+                    "apple":  { "sku": "apple",  "qty": 1 },
+                    "banana": { "sku": "banana", "qty": 2 },
+                }
+            })
+        );
+    }
+
+    /// An absent `(key)`-annotated vector field is omitted from
+    /// the parent JSON object entirely (vectors are nullable —
+    /// same behavior as a plain `[T]` vector).
+    #[test]
+    fn to_json_keyed_vector_absent_omits_field() {
+        let bfbs = build_keyed_bag_schema();
+        let schema = root_as_schema(&bfbs).expect("schema parses");
+        let mut fbb = FlatBufferBuilder::new();
+        let bag = {
+            let t = fbb.start_table();
+            fbb.end_table(t)
+        };
+        fbb.finish_minimal(bag);
+        let buf = fbb.finished_data().to_vec();
+        let value = buf_to_json(&buf, &schema).expect("to_json ok");
+        assert_eq!(value, json!({}));
     }
 }

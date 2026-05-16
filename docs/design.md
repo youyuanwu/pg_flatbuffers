@@ -541,20 +541,24 @@ reflection schema rather than shelling out to `flatc`:
 | `[ubyte]` / `[u8]` | JSON string, base64-encoded (default); honors `(hex)` attribute as lowercase hex |
 | `[T]` for other `T` | JSON array |
 | table / struct | JSON object |
-| vector of `(key)`-annotated tables | JSON object keyed by the `(key)` field's value (deferred — emits as JSON array in v0.1) |
+| vector of `(key)`-annotated tables | JSON object keyed by the `(key)` field's value; `from_json` also accepts a JSON array, and sorts the resulting vector by the key field per the FlatBuffers contract |
 | union | flatc-style sibling field pair: `<name>_type` (string) + `<name>` (variant value); NONE emits only the type field |
 
 #### v0.1 implementation status
 
 `flatbuffers_to_json` / `flatbuffers_to_json_text` and
 `flatbuffers_from_json` / `flatbuffers_from_json_text` are live and
-cover the table above with these carve-outs:
+cover the table above, including the `(key)`-annotated vector ↔
+JSON object sugar (both directions: `to_json` emits a JSON object
+keyed by the `(key)` field; `from_json` accepts either a JSON
+object or a JSON array and sorts the resulting vector by the key
+field per the FlatBuffers contract). The `(hex)` attribute on
+`[ubyte]` is honored both ways (`to_json` emits lowercase hex,
+`from_json` accepts either case). The `pg_flatbuffers.max_apparent_size_mb`
+bound is enforced on `from_json` output (the finished buffer is
+discarded with `FromJsonError::OutputTooLarge` if it exceeds the
+cap). Remaining carve-outs:
 
-- **Vector of `(key)`-annotated tables → JSON object** is rendered as a
-  JSON array instead. The object-keying transformation is a deferred
-  sugar (compose with PG's `jsonb_object_agg` in SQL for now).
-- **`(hex)` attribute on `[ubyte]`** is not yet honored — `[ubyte]`
-  always uses base64 (both directions).
 - **Non-finite floats** (`NaN`, `±Infinity`) raise `ERROR` on the
   `to_json` side rather than serializing as a lossy JSON string. They
   have no native JSON representation, and silently coercing them would
@@ -568,11 +572,6 @@ cover the table above with these carve-outs:
     elements. Schemas with unusual `bytesize` × `minalign` pairs
     (e.g. `(96, 4)`) raise a clear error pointing at the field;
     extending the table is a one-line addition.
-- **`pg_flatbuffers.from_json_unknown = ignore` GUC** is not yet
-  wired — unknown JSON keys always `ERROR`.
-- **`max_apparent_size_mb` cap on output buffer** is not enforced on
-  the `from_json` side yet; nesting is capped via the existing
-  `max_depth` GUC.
 
 ### `from_json` policies
 

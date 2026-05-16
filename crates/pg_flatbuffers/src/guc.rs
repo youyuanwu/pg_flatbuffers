@@ -18,6 +18,7 @@
 //! | `pg_flatbuffers.strict` | `on` | [`current_strict`] — consumed by [`crate::functions`] to decide whether to ERROR or substitute `NULL` on a structural verifier failure (§10 "strict does not relax bounds"). |
 //! | `pg_flatbuffers.fill_scalar_defaults` | `on` | [`current_fill_scalar_defaults`] — consumed by [`crate::query::execute_with_options`] to decide whether an absent scalar table field reads as its schema default (`on`, matches the FlatBuffers reader API) or as SQL `NULL` (`off`, presence-aware) (§4.3, §10). |
 //! | `pg_flatbuffers.key_lookup_strict` | `on` | [`current_key_lookup_strict`] — consumed by [`crate::query::execute_with_options`] to pick between binary search over `(key)`-sorted vectors (`on`, matches the FlatBuffers reader API's `LookupByKey`) or a linear scan that tolerates unsorted vectors (`off`, correct but O(n)) (§7.2 step 4, §10). |
+//! | `pg_flatbuffers.from_json_unknown` | `on` | [`current_from_json_unknown_error`] — consumed by [`crate::from_json`]: `on` (default) raises ERROR on an unknown JSON key for a target table; `off` silently drops it for forward-compat workflows (§8). |
 //!
 //! [`current_bounds`] materialises a [`Bounds`] from the current GUC
 //! values for every call to [`crate::query::execute_with_options`] /
@@ -103,6 +104,15 @@ static FILL_SCALAR_DEFAULTS: GucSetting<bool> = GucSetting::<bool>::new(true);
 /// correct on any vector but O(n). Read-side only; cannot weaken
 /// any safety invariant (§7.2 step 4, §10).
 static KEY_LOOKUP_STRICT: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// Backing storage for `pg_flatbuffers.from_json_unknown`.
+/// Default `true` (`on`) means an unknown JSON key for a target
+/// table raises `ERROR`; `false` (`off`) silently drops it for
+/// forward-compat workflows where producers add fields ahead of
+/// consumers (§8). Write-side only; cannot relax any verifier
+/// bound (the resulting buffer is still verified before any
+/// downstream use).
+static FROM_JSON_UNKNOWN_ERROR: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 // -- Upper-bound sanity caps -----------------------------------------------
 //
@@ -197,6 +207,19 @@ pub fn init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_bool_guc(
+        c"pg_flatbuffers.from_json_unknown",
+        c"When on (default), an unknown JSON key for a target table raises ERROR. When off, unknown keys are silently dropped.",
+        c"Per-session knob (design §8). USERSET-safe: write-side only, \
+          neither weakens the verifier nor relaxes any DoS bound. The \
+          off-mode 'ignore' semantic is useful for forward-compat \
+          workflows where producers add fields ahead of consumers; \
+          the resulting buffer is still verified before any downstream \
+          use.",
+        &FROM_JSON_UNKNOWN_ERROR,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
 }
 
 // -- Read path -------------------------------------------------------------
@@ -245,6 +268,16 @@ pub fn current_fill_scalar_defaults() -> bool {
 /// [`crate::query::ExecuteOptions`] for each call.
 pub fn current_key_lookup_strict() -> bool {
     KEY_LOOKUP_STRICT.get()
+}
+
+/// Current value of `pg_flatbuffers.from_json_unknown`. `true` (the
+/// default) means [`crate::from_json::json_to_buf`] raises
+/// [`crate::from_json::FromJsonError::UnknownField`] on an unknown
+/// JSON key; `false` silently drops the key. Consumed by
+/// [`crate::functions::flatbuffers_from_json`] when building the
+/// per-call [`crate::from_json::BuildOptions`].
+pub fn current_from_json_unknown_error() -> bool {
+    FROM_JSON_UNKNOWN_ERROR.get()
 }
 
 // -- Tests -----------------------------------------------------------------
@@ -404,5 +437,30 @@ mod tests {
         Spi::run("SET pg_flatbuffers.key_lookup_strict = on")
             .expect("SPI: SET key_lookup_strict back on");
         assert!(current_key_lookup_strict());
+    }
+
+    // -- pg_flatbuffers.from_json_unknown --
+
+    /// Default for `pg_flatbuffers.from_json_unknown` is `on`
+    /// (matches design §8: unknown JSON keys raise ERROR by
+    /// default; the off mode is the opt-in forward-compat escape
+    /// hatch).
+    #[pg_test]
+    fn pg_guc_from_json_unknown_default_is_on() {
+        assert!(current_from_json_unknown_error());
+        let v = Spi::get_one::<String>("SHOW pg_flatbuffers.from_json_unknown")
+            .expect("SPI failure")
+            .expect("NULL from SHOW");
+        assert_eq!(v, "on");
+    }
+
+    /// `USERSET` toggling round-trips.
+    #[pg_test]
+    fn pg_guc_from_json_unknown_set_takes_effect_in_same_session() {
+        Spi::run("SET pg_flatbuffers.from_json_unknown = off").expect("SPI: SET from_json_unknown");
+        assert!(!current_from_json_unknown_error());
+        Spi::run("SET pg_flatbuffers.from_json_unknown = on")
+            .expect("SPI: SET from_json_unknown back on");
+        assert!(current_from_json_unknown_error());
     }
 }
