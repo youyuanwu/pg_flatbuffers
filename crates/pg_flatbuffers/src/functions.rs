@@ -34,16 +34,19 @@
 //!   [`crate::verify::Bounds`] from the three `SUSET` GUCs
 //!   (`pg_flatbuffers.max_depth`, `max_tables`,
 //!   `max_apparent_size_mb`). Registration lives in [`crate::guc::init`].
-//! - The `pg_flatbuffers.strict` GUC, which would let
-//!   [`flatbuffers_query`] return `NULL` instead of `ERROR` on a
-//!   structural verifier failure (§10 "strict does not relax
-//!   bounds"). Today we always `ERROR`, matching `strict = on`.
+//! - GUC plumbing for [`crate::guc::current_strict`]
+//!   (`pg_flatbuffers.strict`, `USERSET`, default `on`): each query
+//!   entry point that today raises ERROR on a verifier failure
+//!   instead substitutes the per-shape "no leaves" sentinel when
+//!   `strict = off`, *except* for bound exceedances which always
+//!   ERROR (§10 "strict does not relax bounds"). The classification
+//!   uses [`crate::verify::VerifyError::is_bound_exceedance`].
 //! - Verifier result caching (design §10) — only useful when many
 //!   query invocations share a buffer in one statement; we'll add
 //!   it once usage shows it matters.
 
-use crate::guc::current_bounds;
-use crate::query::{execute, parse};
+use crate::guc::{current_bounds, current_strict};
+use crate::query::{execute, parse, ExecuteError};
 use crate::schema_cache::lookup_schema;
 use crate::verify::verify;
 use pgrx::iter::SetOfIterator;
@@ -92,7 +95,7 @@ fn flatbuffers_query(query: &str, buf: &[u8]) -> Option<String> {
 
     let leaves = match execute(buf, &schema_view, &parsed, &current_bounds()) {
         Ok(v) => v,
-        Err(e) => error!("flatbuffers_query: {e}"),
+        Err(e) => resolve_execute_error("flatbuffers_query", e, current_strict()),
     };
 
     // First leaf, regardless of present/absent. For paths without
@@ -134,7 +137,10 @@ fn flatbuffers_query_array(query: &str, buf: &[u8]) -> Vec<String> {
 
     match execute(buf, &schema_view, &parsed, &current_bounds()) {
         Ok(v) => v.into_iter().flatten().collect(),
-        Err(e) => error!("flatbuffers_query_array: {e}"),
+        Err(e) => resolve_execute_error("flatbuffers_query_array", e, current_strict())
+            .into_iter()
+            .flatten()
+            .collect(),
     }
 }
 
@@ -176,7 +182,7 @@ fn flatbuffers_query_multi(query: &str, buf: &[u8]) -> SetOfIterator<'static, St
 
     let leaves = match execute(buf, &schema_view, &parsed, &current_bounds()) {
         Ok(v) => v,
-        Err(e) => error!("flatbuffers_query_multi: {e}"),
+        Err(e) => resolve_execute_error("flatbuffers_query_multi", e, current_strict()),
     };
 
     SetOfIterator::new(leaves.into_iter().flatten())
@@ -274,6 +280,46 @@ fn split_schema_and_table(input: &str) -> Result<(&str, &str), &'static str> {
     }
 }
 
+/// Classify an [`ExecuteError`] under the current
+/// `pg_flatbuffers.strict` setting. Returns `true` when the call
+/// site should raise ERROR; `false` when it should substitute the
+/// per-shape "no leaves" sentinel.
+///
+/// Rules (design §10 "strict does not relax bounds"):
+///
+/// - `strict = on` → always ERROR.
+/// - `strict = off` and a verifier *bound* exceedance (depth, table
+///   count, apparent size) → still ERROR; `USERSET` cannot weaken a
+///   `SUSET`-protected bound.
+/// - `strict = off` and a verifier *structural* failure (malformed
+///   bytes, missing required field, etc.) → no ERROR; substitute.
+/// - `strict = off` and any *non-verifier* failure (`FieldNotFound`,
+///   `UnsupportedType`, `UnsupportedStep`, `Internal`) → still
+///   ERROR. These are *caller* / *schema* problems, not buffer
+///   problems, so silencing them would mask bugs.
+fn should_error_on(strict: bool, e: &ExecuteError) -> bool {
+    if strict {
+        return true;
+    }
+    match e {
+        ExecuteError::Verify(v) => v.is_bound_exceedance(),
+        _ => true,
+    }
+}
+
+/// Apply [`should_error_on`] and either raise Postgres ERROR with a
+/// caller-prefixed message, or return the empty `Vec<Option<String>>`
+/// that the call site reshapes into its public no-match sentinel
+/// (`NULL` / `text[] = '{}'` / zero rows). [`error!`] diverges, so
+/// the function appears to "return" `Vec::new()` only on the
+/// substitute branch.
+fn resolve_execute_error(fn_name: &str, e: ExecuteError, strict: bool) -> Vec<Option<String>> {
+    if should_error_on(strict, &e) {
+        error!("{fn_name}: {e}");
+    }
+    Vec::new()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -327,6 +373,55 @@ mod unit_tests {
     fn split_rejects_three_components() {
         // Likely a user pasted a full `flatbuffers_query` argument.
         assert!(split_schema_and_table("default:Order:id").is_err());
+    }
+
+    // -- should_error_on classifier --
+
+    use crate::query::ExecuteError;
+    use crate::verify::VerifyError;
+
+    fn structural_verify_err() -> ExecuteError {
+        ExecuteError::Verify(VerifyError::Invalid(
+            "Range [0, 4) is out of bounds".to_owned(),
+        ))
+    }
+
+    fn bound_verify_err() -> ExecuteError {
+        ExecuteError::Verify(VerifyError::Invalid("depth 65 exceeds limit 64".to_owned()))
+    }
+
+    #[test]
+    fn should_error_on_strict_on_structural_is_true() {
+        assert!(should_error_on(true, &structural_verify_err()));
+    }
+
+    #[test]
+    fn should_error_on_strict_on_bound_is_true() {
+        assert!(should_error_on(true, &bound_verify_err()));
+    }
+
+    #[test]
+    fn should_error_on_strict_off_structural_is_false() {
+        // strict = off swallows a structural verifier failure into
+        // the substitute path.
+        assert!(!should_error_on(false, &structural_verify_err()));
+    }
+
+    #[test]
+    fn should_error_on_strict_off_bound_still_errors() {
+        // §10: strict does not relax bounds — depth / tables /
+        // apparent size always ERROR even with strict = off.
+        assert!(should_error_on(false, &bound_verify_err()));
+    }
+
+    #[test]
+    fn should_error_on_strict_off_non_verify_still_errors() {
+        // Caller / schema errors are not silenced by strict = off.
+        let e = ExecuteError::FieldNotFound {
+            what: "missing".to_owned(),
+            table: "T".to_owned(),
+        };
+        assert!(should_error_on(false, &e));
     }
 }
 
@@ -1422,6 +1517,47 @@ mod tests {
         register("default", "T", build_t_schema_bfbs());
         Spi::get_one::<String>("SELECT flatbuffers_query('T:n', '\\x00010203'::bytea)")
             .expect("SPI failure");
+    }
+
+    /// `strict = off` turns a *structural* verifier failure into a
+    /// NULL result for the scalar entry point (design §10).
+    #[pg_test]
+    fn pg_query_strict_off_garbage_returns_null() {
+        register("default", "T", build_t_schema_bfbs());
+        Spi::run("SET pg_flatbuffers.strict = off").expect("SET");
+        let v = Spi::get_one::<String>("SELECT flatbuffers_query('T:n', '\\x00010203'::bytea)")
+            .expect("SPI failure");
+        assert!(v.is_none(), "expected NULL under strict=off, got {v:?}");
+    }
+
+    /// `strict = off` turns a *structural* verifier failure into an
+    /// empty `text[]` for the array entry point.
+    #[pg_test]
+    fn pg_query_array_strict_off_garbage_returns_empty_array() {
+        register("default", "T", build_t_schema_bfbs());
+        Spi::run("SET pg_flatbuffers.strict = off").expect("SET");
+        let v = Spi::get_one::<Vec<Option<String>>>(
+            "SELECT flatbuffers_query_array('T:n', '\\x00010203'::bytea)",
+        )
+        .expect("SPI failure");
+        assert_eq!(
+            v.as_deref(),
+            Some(&[][..]),
+            "expected empty text[] under strict=off, got {v:?}",
+        );
+    }
+
+    /// `strict = off` turns a *structural* verifier failure into a
+    /// zero-row setof for the multi entry point.
+    #[pg_test]
+    fn pg_query_multi_strict_off_garbage_returns_zero_rows() {
+        register("default", "T", build_t_schema_bfbs());
+        Spi::run("SET pg_flatbuffers.strict = off").expect("SET");
+        let n = Spi::get_one::<i64>(
+            "SELECT count(*) FROM flatbuffers_query_multi('T:n', '\\x00010203'::bytea)",
+        )
+        .expect("SPI failure");
+        assert_eq!(n, Some(0));
     }
 
     /// Unknown schema name surfaces the `lookup_schema` ERROR

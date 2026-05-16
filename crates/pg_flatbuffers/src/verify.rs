@@ -134,11 +134,11 @@ pub enum VerifyError {
 
 impl VerifyError {
     /// True if the failure is a *bound exceedance* (depth, tables,
-    /// apparent size) rather than a structural invalidity. Used by
-    /// future `flatbuffers_query` call sites where
-    /// `pg_flatbuffers.strict = off` substitutes `NULL` for
-    /// structural failures but still ERRORs on bound exceedance —
-    /// see design §10 ("strict does not relax bounds").
+    /// apparent size) rather than a structural invalidity. Consumed
+    /// by [`crate::functions::should_error_on`] so that the
+    /// `pg_flatbuffers.strict = off` lenient path still raises
+    /// ERROR on bound failures — see design §10 ("strict does not
+    /// relax bounds").
     ///
     /// The upstream verifier exposes bound failures only through the
     /// error message (no machine-readable code), so this is a string
@@ -146,13 +146,6 @@ impl VerifyError {
     /// `Display` output. Conservative: callers can treat `false` as
     /// "not provably a bound failure" without misclassifying anything
     /// as a structural error.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "only consumed from the in-module test suite; production call site lands with the deferred `pg_flatbuffers.strict` GUC plumbing (§10)"
-        )
-    )]
     pub fn is_bound_exceedance(&self) -> bool {
         match self {
             VerifyError::Invalid(msg) => {
