@@ -36,7 +36,7 @@ jobs:
       RUST_BACKTRACE: short
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # Build deps for compiling Postgres from source under `cargo pgrx init`.
       # Mirrors the apt list `just doctor` recommends.
@@ -50,7 +50,7 @@ jobs:
             curl tar
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       # Single source of truth for the Rust version: rust-toolchain.toml.
       # Parse the `channel = "X.Y.Z"` value so the dtolnay action below
@@ -85,7 +85,7 @@ jobs:
       # we don't recompile it on every run.
       - name: Cache cargo-pgrx binary
         id: pgrx-bin-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-pgrx
           key: cargo-pgrx-${{ runner.os }}-${{ env.PGRX_VERSION }}
@@ -100,7 +100,7 @@ jobs:
       # PG major) — a bump in any of those triggers a rebuild.
       - name: Cache provisioned Postgres ($PGRX_HOME)
         id: pgrx-pg-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.PGRX_HOME }}
           key: pgrx-pg-${{ runner.os }}-${{ env.PGRX_VERSION }}-pg${{ matrix.pg-major }}
