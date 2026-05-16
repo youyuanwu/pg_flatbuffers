@@ -15,6 +15,7 @@ mod functions;
 mod guc;
 mod query;
 mod schema_cache;
+mod to_json;
 mod verify;
 
 // Catalog DDL. Must be emitted *after* the Rust functions it

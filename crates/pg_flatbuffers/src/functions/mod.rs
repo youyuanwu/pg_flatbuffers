@@ -23,12 +23,13 @@
 //! - [`flatbuffers_verify`] — boolean, suitable for `CHECK`.
 //! - [`flatbuffers_root_type`] — diagnostic helper returning the
 //!   registered root-table name.
+//! - [`flatbuffers_to_json`] / [`flatbuffers_to_json_text`] —
+//!   reflection-driven FlatBuffer → JSON conversion (design §8).
 //!
 //! ### Deliberately deferred (each gets its own micro-slice)
 //!
-//! - `flatbuffers_to_json{,_text}` and
-//!   `flatbuffers_from_json{,_text}` — live in a future
-//!   `json.rs` slice.
+//! - `flatbuffers_from_json{,_text}` — live in a future
+//!   `from_json.rs` slice.
 //! - GUC plumbing for [`crate::verify::Bounds`]: each entry point
 //!   calls [`crate::guc::current_bounds`], which materialises a
 //!   [`crate::verify::Bounds`] from the three `SUSET` GUCs
@@ -53,6 +54,7 @@ mod query;
 mod query_array;
 mod query_multi;
 mod root_type;
+mod to_json;
 mod util;
 mod verify;
 

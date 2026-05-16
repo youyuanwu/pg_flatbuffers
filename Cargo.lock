@@ -987,12 +987,14 @@ dependencies = [
 name = "pg_flatbuffers"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "flatbuffers",
  "flatbuffers-reflection",
  "lru",
  "parking_lot",
  "pgrx",
  "pgrx-tests",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

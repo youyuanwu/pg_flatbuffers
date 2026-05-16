@@ -541,8 +541,27 @@ reflection schema rather than shelling out to `flatc`:
 | `[ubyte]` / `[u8]` | JSON string, base64-encoded (default); honors `(hex)` attribute as lowercase hex |
 | `[T]` for other `T` | JSON array |
 | table / struct | JSON object |
-| vector of `(key)`-annotated tables | JSON object keyed by the `(key)` field's value |
-| union | JSON object `{"<member>": <value>}` (matches `flatc --strict-json`) |
+| vector of `(key)`-annotated tables | JSON object keyed by the `(key)` field's value (deferred — emits as JSON array in v0.1) |
+| union | flatc-style sibling field pair: `<name>_type` (string) + `<name>` (variant value); NONE emits only the type field |
+
+#### v0.1 implementation status
+
+`flatbuffers_to_json` / `flatbuffers_to_json_text` are live and cover
+the table above with three carve-outs:
+
+- **Vector of `(key)`-annotated tables → JSON object** is rendered as a
+  JSON array instead. The object-keying transformation is a deferred
+  sugar (compose with PG's `jsonb_object_agg` in SQL for now).
+- **`(hex)` attribute on `[ubyte]`** is not yet honored — `[ubyte]`
+  always renders as base64.
+- **Non-finite floats** (`NaN`, `±Infinity`) raise `ERROR` rather than
+  serializing as a lossy JSON string. They have no native JSON
+  representation, and silently coercing them would break round-trip
+  through `from_json`. Callers with non-finite values must use the
+  per-field accessor functions.
+
+`flatbuffers_from_json` / `flatbuffers_from_json_text` are still on
+the roadmap; the policies below specify them.
 
 ### `from_json` policies
 

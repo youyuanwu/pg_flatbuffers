@@ -13,5 +13,6 @@ mod query;
 mod query_array;
 mod query_multi;
 mod root_type;
+mod to_json;
 mod vector64;
 mod verify;

@@ -4,6 +4,7 @@
     "cargo test": true,
     "cargo build": true,
     "cargo fmt": true,
-    "cargo clippy": true
+    "cargo clippy": true,
+    "cargo check": true
   }
 }
